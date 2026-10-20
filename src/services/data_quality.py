@@ -1,0 +1,105 @@
+"""Data Quality Gate: sanitization, PII hashing, and validation engine."""
+
+import hashlib
+import re
+from datetime import date
+from typing import Optional
+from src.domain.enums import InputTypeEnum
+from src.domain.models import DataQualityResult, ExpenseRecord, LLMExtractionResponse
+
+
+class DataQualityGate:
+    """Enforces data contracts, privacy compliance, and integrity rules."""
+
+    MIN_CONFIDENCE_THRESHOLD: float = 0.65
+    VALID_CURRENCY_REGEX = re.compile(r"^[A-Z]{3}$")
+    FORMULA_INJECTION_PREFIXES = ("=", "+", "-", "@")
+
+    @classmethod
+    def hash_phone_number(cls, phone_number: str) -> str:
+        """Hash phone number using SHA-256 to ensure PII compliance."""
+        clean_phone = re.sub(r"\D", "", phone_number)
+        return hashlib.sha256(clean_phone.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def sanitize_string_for_sheets(cls, value: Optional[str]) -> str:
+        """Sanitize text to prevent CSV/Formula injection in spreadsheets."""
+        if not value:
+            return ""
+        trimmed = value.strip()
+        if trimmed.startswith(cls.FORMULA_INJECTION_PREFIXES):
+            return f"'{trimmed}"
+        return trimmed
+
+    @classmethod
+    def validate_and_sanitize(
+        cls,
+        llm_response: LLMExtractionResponse,
+        message_id: str,
+        user_phone: str,
+        input_type: InputTypeEnum,
+    ) -> DataQualityResult:
+        """Validate extraction output against business rules and return DataQualityResult."""
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        tx = llm_response.transaction
+        meta = llm_response.metadata
+
+        # 1. Confidence Score Check
+        if meta.confidence_score < cls.MIN_CONFIDENCE_THRESHOLD:
+            errors.append(
+                f"Confidence score ({meta.confidence_score:.2f}) is below minimum acceptable threshold ({cls.MIN_CONFIDENCE_THRESHOLD:.2f})"
+            )
+
+        # 2. Amount Validation
+        if tx.amount <= 0:
+            errors.append(f"Invalid transaction amount: {tx.amount}. Amount must be strictly positive.")
+
+        # 3. Currency Validation
+        currency_clean = tx.currency.upper().strip()
+        if not cls.VALID_CURRENCY_REGEX.match(currency_clean):
+            errors.append(f"Currency code '{tx.currency}' must follow ISO 4217 (3 uppercase letters).")
+
+        # 4. Future Date Check (Warning, not blocking)
+        today = date.today()
+        if tx.transaction_date > today:
+            warnings.append(
+                f"Transaction date {tx.transaction_date.isoformat()} is in the future. Today is {today.isoformat()}."
+            )
+
+        # If errors encountered, return invalid result
+        if errors:
+            return DataQualityResult(
+                is_valid=False,
+                confidence_score=meta.confidence_score,
+                errors=errors,
+                warnings=warnings,
+                sanitized_record=None,
+            )
+
+        # Build sanitized persistent entity
+        sanitized_record = ExpenseRecord(
+            message_id=message_id,
+            user_phone_hash=cls.hash_phone_number(user_phone),
+            input_type=input_type,
+            transaction_date=tx.transaction_date,
+            transaction_time=tx.transaction_time,
+            amount=round(tx.amount, 2),
+            currency=currency_clean,
+            category=tx.category.value,
+            subcategory=cls.sanitize_string_for_sheets(tx.subcategory),
+            merchant_name=cls.sanitize_string_for_sheets(tx.merchant_name) if tx.merchant_name else None,
+            payment_method=tx.payment_method.value,
+            description=cls.sanitize_string_for_sheets(tx.description),
+            confidence_score=meta.confidence_score,
+            raw_text=cls.sanitize_string_for_sheets(meta.raw_text),
+        )
+
+        return DataQualityResult(
+            is_valid=True,
+            confidence_score=meta.confidence_score,
+            errors=[],
+            warnings=warnings,
+            sanitized_record=sanitized_record,
+        )

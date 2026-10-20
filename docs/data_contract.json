@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExpenseExtractionContract",
+  "type": "object",
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "confidence_score": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Nivel de certeza de la extracción (0.0 a 1.0)"
+        },
+        "raw_text": {
+          "type": "string",
+          "description": "Transcripción del audio, OCR del ticket o texto original recibido"
+        },
+        "extraction_notes": {
+          "type": "string",
+          "description": "Dudas o ambigüedades encontradas (ej. 'Monto dudoso')"
+        }
+      },
+      "required": ["confidence_score", "raw_text"],
+      "additionalProperties": false
+    },
+    "transaction": {
+      "type": "object",
+      "properties": {
+        "transaction_date": {
+          "type": "string",
+          "format": "date",
+          "description": "Fecha de la compra en formato ISO 8601 (YYYY-MM-DD)"
+        },
+        "transaction_time": {
+          "type": ["string", "null"],
+          "pattern": "^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$",
+          "description": "Hora de la compra (HH:mm:ss) o null si no se detectó"
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "Código de moneda según ISO 4217 (ej. USD, EUR, MXN, ARS, COP)"
+        },
+        "payment_method": {
+          "type": "string",
+          "enum": ["CASH", "CREDIT_CARD", "DEBIT_CARD", "BANK_TRANSFER", "CRYPTO", "OTHER", "UNKNOWN"],
+          "description": "Canal o medio de pago normalizado"
+        },
+        "merchant_name": {
+          "type": ["string", "null"],
+          "description": "Nombre del comercio o proveedor (ej. 'Walmart', 'Shell')"
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "ALIMENTACION",
+            "TRANSPORTE",
+            "VIVIENDA",
+            "SERVICIOS",
+            "SALUD",
+            "ENTRETENIMIENTO",
+            "EDUCACION",
+            "COMPRAS",
+            "OTROS"
+          ],
+          "description": "Categoría macro estandarizada"
+        },
+        "subcategory": {
+          "type": "string",
+          "description": "Detalle granular (ej. 'Restaurante', 'Supermercado', 'Combustible')"
+        },
+        "description": {
+          "type": "string",
+          "description": "Resumen claro del gasto"
+        },
+        "amount": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Monto total del gasto en valor numérico positivo con 2 decimales"
+        }
+      },
+      "required": [
+        "transaction_date",
+        "currency",
+        "payment_method",
+        "category",
+        "subcategory",
+        "description",
+        "amount"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": ["metadata", "transaction"],
+  "additionalProperties": false
+}
