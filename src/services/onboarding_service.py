@@ -42,7 +42,18 @@ class OnboardingService:
     async def handle(self, parsed_msg: ParsedWhatsAppMessage, user: Optional[UserRecord]) -> None:
         """Advance the onboarding of an unknown user. Never registers expenses."""
         phone = parsed_msg.sender_phone
-        current = user.onboarding_data() if user else OnboardingData()
+
+        # First contact: register the number right away, so the administrator sees who wrote (and when),
+        # even if the person never sends their data
+        if user is None:
+            try:
+                user = await asyncio.to_thread(self.user_repository.save_onboarding, phone, OnboardingData())
+            except Exception as e:
+                logger.error(f"Could not register new user {mask_phone(phone)}: {e}")
+                await self.whatsapp_client.send_text_message(phone, ONBOARDING_ERROR_MESSAGE)
+                return
+
+        current = user.onboarding_data()
 
         # Everything was already collected: just wait for the administrator (no LLM call, no cost)
         if current.is_complete:

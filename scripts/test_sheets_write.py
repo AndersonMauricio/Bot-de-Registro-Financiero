@@ -9,7 +9,7 @@ from uuid import uuid4
 from src.core.config import settings
 from src.core.logging import logger
 from src.domain.enums import InputTypeEnum
-from src.domain.models import ExpenseRecord
+from src.domain.models import EXPENSE_SHEET_HEADERS, ExpenseRecord
 from src.infrastructure.storage.sheets_repo import GoogleSheetsExpenseRepository
 
 
@@ -25,16 +25,16 @@ def test_write():
     sample_record = ExpenseRecord(
         transaction_id=uuid4(),
         message_id=f"test_cli_{uuid4().hex[:8]}",
-        user_phone_hash="a" * 64,
+        user_phone_hash="0" * 64,  # fictitious hash: no real phone number is involved
         input_type=InputTypeEnum.TEXT,
         transaction_date=date.today(),
         transaction_time=time(12, 0, 0),
         amount=99.99,
         currency="USD",
-        category="ALIMENTACION",
+        category="Alimentación",
         subcategory="Prueba Técnica",
         merchant_name="Test Store",
-        payment_method="CREDIT_CARD",
+        payment_method="Tarjeta de Crédito",
         description="Fila de prueba escrita desde el script de verificación",
         confidence_score=0.99,
         raw_text="Prueba de inserción en Google Sheets",
@@ -44,17 +44,15 @@ def test_write():
         assigned_id = repo.save_expense(sample_record)
         sheet_row = sample_record.to_sheets_row()
         print("\n✅ ¡ÉXITO TOTAL!")
-        print(f"👉 Fila insertada correctamente con los 5 campos exactos:")
-        print(f"   1. timestamp (UTC-3): {sheet_row[0]}")
-        print(f"   2. monto:             {sheet_row[1]}")
-        print(f"   3. moneda:            {sheet_row[2]}")
-        print(f"   4. categoria:         {sheet_row[3]}")
-        print(f"   5. descripcion:       {sheet_row[4]}")
+        print(f"👉 Fila insertada correctamente con las {len(sheet_row)} columnas del esquema:")
+        for position, (column, value) in enumerate(zip(EXPENSE_SHEET_HEADERS, sheet_row), start=1):
+            print(f"   {position:>2}. {column:<16} {value}")
         print(f"\nRevisa tu hoja de cálculo en la pestaña '{settings.WORKSHEET_NAME}'.")
     except Exception as e:
         print(f"\n❌ ERROR AL ESCRIBIR EN GOOGLE SHEETS:\n{e}")
         print("\n🛠️ Posibles causas:")
         print("1. Falta el archivo .json de credenciales de Google Cloud en 'config/credentials/'")
+        print(f"   (o la fila 1 de la pestaña no tiene los encabezados: {', '.join(EXPENSE_SHEET_HEADERS)})")
         print(f"2. La hoja no está compartida con permiso de 'Editor' al email: {settings.GOOGLE_APPLICATION_CREDENTIALS or 'de tu Service Account'}")
         print(f"3. La pestaña '{settings.WORKSHEET_NAME}' no existe dentro del documento.")
 

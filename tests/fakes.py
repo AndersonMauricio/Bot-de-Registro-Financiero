@@ -71,6 +71,8 @@ class FakeUserRepository(UserRepositoryInterface):
         self.get_calls = 0
         self.fail_reads = False
         self.fail_writes = False
+        self.invalidated: list[str] = []
+        self.invalidated_all = 0
 
     def get_user(self, phone: str) -> Optional[UserRecord]:
         self.get_calls += 1
@@ -86,11 +88,17 @@ class FakeUserRepository(UserRepositoryInterface):
         record = UserRecord(
             phone=phone,
             status=current.status if current else None,
-            full_name=data.full_name,
-            email=data.email,
+            full_name=data.full_name or (current.full_name if current else None),
+            email=data.email or (current.email if current else None),
         )
         self.users[phone] = record
         return record
+
+    def invalidate(self, phone: str) -> None:
+        self.invalidated.append(phone)
+
+    def invalidate_all(self) -> None:
+        self.invalidated_all += 1
 
 
 class FakeGroq:
@@ -137,6 +145,7 @@ class FakeExpenseRepository(ExpenseRepositoryInterface):
         self.saved = []
         self.processed: set[str] = set()
         self.fail_save = False
+        self.queried_hashes: list[str] = []
 
     def save_expense(self, record) -> str:
         if self.fail_save:
@@ -148,30 +157,142 @@ class FakeExpenseRepository(ExpenseRepositoryInterface):
     def is_message_processed(self, message_id: str) -> bool:
         return message_id in self.processed
 
+    def get_expenses_by_user(self, user_phone_hash: str) -> list[dict]:
+        self.queried_hashes.append(user_phone_hash)
+        return [
+            {
+                "fecha_gasto": r.transaction_date.isoformat(),
+                "monto": r.amount,
+                "moneda": r.currency,
+                "categoria": r.category,
+                "subcategoria": r.subcategory,
+                "medio_de_pago": r.payment_method,
+                "descripcion": r.description,
+            }
+            for r in self.saved
+            if r.user_phone_hash == user_phone_hash
+        ]
+
 
 class FakeWorksheet:
-    """Minimal in-memory stand-in for gspread.Worksheet (only what the users repository calls)."""
+    """Minimal in-memory stand-in for gspread.Worksheet (only what the repositories call).
+
+    Like Google Sheets with USER_ENTERED, a leading apostrophe marks text and is not stored as part of the value.
+    """
 
     def __init__(self, rows: list[list]):
         self.rows = [list(r) for r in rows]
         self.reads = 0
-        self.appends: list[tuple[list, object]] = []  # (values, value_input_option)
+        self.appends: list[tuple[list, object]] = []  # (values as sent, value_input_option)
         self.batch_updates: list[list[dict]] = []
         self.read_error: Optional[Exception] = None
+
+    def _padded(self) -> list[list]:
+        width = max((len(r) for r in self.rows), default=0)
+        return [r + [""] * (width - len(r)) for r in self.rows]
 
     def get_all_values(self, value_render_option=None, **kwargs) -> list[list]:
         self.reads += 1
         if self.read_error:
             raise self.read_error
-        width = max((len(r) for r in self.rows), default=0)
-        return [r + [""] * (width - len(r)) for r in self.rows]
+        return self._padded()
+
+    def row_values(self, row: int, **kwargs) -> list:
+        self.reads += 1
+        if self.read_error:
+            raise self.read_error
+        return list(self.rows[row - 1]) if len(self.rows) >= row else []
+
+    def col_values(self, col: int, **kwargs) -> list:
+        self.reads += 1
+        if self.read_error:
+            raise self.read_error
+        return [r[col - 1] if len(r) >= col else "" for r in self.rows]
 
     def append_row(self, values, value_input_option=None, **kwargs) -> None:
         self.appends.append((list(values), value_input_option))
-        self.rows.append(list(values))
+        stored = list(values)
+        if str(value_input_option).endswith("USER_ENTERED") or value_input_option == "USER_ENTERED":
+            stored = [v[1:] if isinstance(v, str) and v.startswith("'") else v for v in stored]
+        self.rows.append(stored)
 
     def batch_update(self, data, raw: bool = True, **kwargs) -> None:
         self.batch_updates.append(data)
         for item in data:
             row, col = a1_to_rowcol(item["range"])
             self.rows[row - 1][col - 1] = item["values"][0][0]
+
+
+class FakeReportWorksheet:
+    """The first tab of a freshly created report spreadsheet."""
+
+    def __init__(self):
+        self.title = "Hoja 1"
+        self.values: list[list] = []
+        self.value_input_option = None
+        self.frozen_rows = 0
+        self.header_format = None
+        self.size = None
+
+    def update_title(self, title):
+        self.title = title
+
+    def resize(self, rows=None, cols=None):
+        self.size = (rows, cols)
+
+    def update(self, values, range_name=None, value_input_option=None, **kwargs):
+        self.values = values
+        self.value_input_option = value_input_option
+
+    def freeze(self, rows=None, cols=None):
+        self.frozen_rows = rows
+
+    def format(self, range_name, fmt):
+        self.header_format = (range_name, fmt)
+
+
+class FakeSpreadsheet:
+    def __init__(self, title: str, folder_id, fail_share: bool = False):
+        self.title, self.folder_id = title, folder_id
+        self.id = "sheet-123"
+        self.url = "https://docs.google.com/spreadsheets/d/sheet-123"
+        self.sheet1 = FakeReportWorksheet()
+        self.shares: list[tuple] = []
+        self._fail_share = fail_share
+
+    def share(self, email_address, perm_type, role, **kwargs):
+        if self._fail_share:
+            raise RuntimeError("drive share failed")
+        self.shares.append((email_address, perm_type, role))
+
+
+class FakeGspreadClient:
+    """Stands in for gspread.Client where reports are created (and cleaned up on failure)."""
+
+    def __init__(self, fail_share: bool = False):
+        self.created: list[FakeSpreadsheet] = []
+        self.deleted: list[str] = []
+        self._fail_share = fail_share
+
+    def create(self, title, folder_id=None):
+        spreadsheet = FakeSpreadsheet(title, folder_id, self._fail_share)
+        self.created.append(spreadsheet)
+        return spreadsheet
+
+    def del_spreadsheet(self, file_id):
+        self.deleted.append(file_id)
+
+
+class FakeReportPublisher:
+    """Stands in for GoogleSheetsReportPublisher."""
+
+    def __init__(self, url: str = "https://docs.google.com/spreadsheets/d/fake"):
+        self.url = url
+        self.calls: list[tuple[str, list[dict], str]] = []
+        self.error: Optional[Exception] = None
+
+    def publish(self, title: str, rows: list[dict], share_with_email: str) -> str:
+        if self.error:
+            raise self.error
+        self.calls.append((title, rows, share_with_email))
+        return self.url

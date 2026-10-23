@@ -30,14 +30,20 @@ flowchart TD
         API --> ROUTER{"Estado del número (caché en memoria)"}
         ROUTER -->|"2 Rechazado"| DENY["Mensaje de acceso denegado"]
         ROUTER -->|"Vacío / nuevo"| ONB["Onboarding con ONBOARDING_SYSTEM_PROMPT"]
-        ONB --> PEND["Guarda nombre y email y avisa que requiere aprobación manual"]
+        ONB --> PEND["Registra el número al primer contacto, guarda nombre y email y avisa que requiere aprobación manual"]
         ROUTER -->|"1 Aprobado"| INPUT{"Tipo de entrada"}
+        ADMIN["Administrador edita Estado"] --> USERS[("Google Sheets: usuarios")]
+        PEND --> USERS
+        USERS -.->|"Apps Script onEdit"| HOOK["FastAPI: /api/v1/webhooks/sheets"]
+        HOOK -.->|"invalida solo ese número"| ROUTER
     end
 
-    subgraph Expenses["3. Registro de gastos (solo usuarios aprobados)"]
+    subgraph Expenses["3. Gastos y reportes (solo usuarios aprobados)"]
         INPUT -->|"Audio"| WHISPER["Groq Whisper"]
-        INPUT -->|"Texto / imagen con descripción"| LLM["Groq LLM con EXTRACTION_SYSTEM_PROMPT"]
-        WHISPER --> LLM
+        INPUT -->|"Texto / imagen con descripción"| INTENT{"¿Pide su reporte?"}
+        WHISPER --> INTENT
+        INTENT -->|"No"| LLM["Groq LLM con EXTRACTION_SYSTEM_PROMPT"]
+        INTENT -->|"Sí: quiero mi resumen"| REPORT["Filtra por user_phone_hash, crea un Spreadsheet y lo comparte en solo lectura con su email"]
         LLM --> DQ{"Data Quality Gate"}
         DQ -->|"Falla / duda"| ASK["Pide aclarar monto y concepto"]
         DQ -->|"Pasa"| SANITIZE["Sanitización y hash PII"]
@@ -46,11 +52,13 @@ flowchart TD
     subgraph Storage["4. Almacenamiento"]
         SANITIZE -->|"Fase 1: MVP"| GS[("Google Sheets: raw_expenses")]
         SANITIZE -.->|"Fase 2: Target"| PG[("PostgreSQL")]
+        GS -.->|"gastos de ese usuario"| REPORT
     end
 
     DENY --> OUT["Respuesta al usuario vía Evolution API"]
     PEND --> OUT
     ASK --> OUT
+    REPORT -->|"link del reporte"| OUT
     GS -->|"confirmación"| OUT
     PG -.->|"confirmación"| OUT
 ```
@@ -61,6 +69,8 @@ flowchart TD
 - **"Escribiendo…":** mientras Groq transcribe o procesa, el bot envía la presencia `composing` por Evolution y la corta justo antes de responder.
 - **Concurrencia:** se procesa un mensaje a la vez por número y se descartan las reentregas del webhook (mismo `message_id`).
 - **Audio:** se toma del base64 inline del webhook; si falta o viene corrupto, se descarga desde Evolution (`getBase64FromMediaMessage`) y se transcribe con Whisper.
+- **Aprobaciones en tiempo real:** un Apps Script en la hoja avisa a `/api/v1/webhooks/sheets` cuando se edita `Estado` y el bot olvida solo ese número ([guía](docs/apps_script_usuarios.md)). Si no se puede releer, falla cerrado.
+- **Reportes por demanda:** "quiero mi resumen" (texto o audio) no se registra como gasto: se genera un Spreadsheet con **solo los gastos de ese usuario** (filtro estricto por `user_phone_hash`) y se comparte en solo lectura con el email del onboarding.
 
 ---
 
@@ -74,29 +84,36 @@ bot-wpp/
 ├── pyproject.toml / requirements.txt
 ├── docker/                        # Dockerfile y entrypoint
 ├── config/credentials/            # JSON de la cuenta de servicio de Google (ignorado por git)
+├── apps_script/
+│   └── usuarios_onedit.gs         # Disparador de Google Apps Script (aprobaciones en tiempo real)
 ├── docs/
 │   ├── data_contract.json         # JSON Schema formal del LLM
-│   └── sheets_schema.md           # Diccionario de datos de Google Sheets (gastos y usuarios)
+│   ├── sheets_schema.md           # Diccionario de datos de Google Sheets (gastos, usuarios y reportes)
+│   ├── apps_script_usuarios.md    # Instalación del Apps Script
+│   ├── instructivo_docker.md      # Guía punta a punta con Docker
+│   └── instructivo_local.md       # Guía punta a punta en entorno local
 ├── scripts/
 │   ├── setup_evolution_webhook.py # Apunta el webhook de Evolution API a este servicio
 │   ├── check_groq.py              # Diagnóstico de los modelos disponibles en Groq
 │   └── test_sheets_write.py       # Prueba de escritura en la hoja de gastos
 ├── src/
 │   ├── main.py                    # Aplicación FastAPI
-│   ├── api/v1/                    # webhooks.py (Evolution), health.py, dependencies.py
+│   ├── api/v1/                    # webhooks.py (Evolution y Sheets), health.py, dependencies.py
 │   ├── core/                      # Configuración, logging, excepciones y helpers de teléfono
 │   ├── domain/                    # Enums y modelos Pydantic
 │   ├── services/
 │   │   ├── message_router.py      # Ruteo por estado del número (1 / 2 / vacío)
 │   │   ├── onboarding_service.py  # Alta de usuarios desconocidos
 │   │   ├── expense_service.py     # Registro de gastos (usuarios aprobados)
+│   │   ├── report_intent.py       # Detección de pedidos de reporte
+│   │   ├── report_service.py      # Reporte por demanda (aislado por usuario)
 │   │   └── data_quality.py        # Data Quality Gate
 │   └── infrastructure/
 │       ├── whatsapp/              # Cliente y parser de Evolution API
 │       ├── llm/                   # Cliente de Groq y prompts (onboarding / extracción)
 │       ├── audio/                 # Transcripción con Groq Whisper
 │       ├── cache/                 # Caché TTL en memoria
-│       └── storage/               # Repositorios: Sheets (gastos y usuarios) y PostgreSQL
+│       └── storage/               # Repositorios: Sheets (gastos, usuarios, reportes) y PostgreSQL
 └── tests/                         # Unitarios y flujo end-to-end (sin red ni credenciales reales)
 ```
 
@@ -104,15 +121,15 @@ bot-wpp/
 
 ## 🔐 Control de Acceso y Onboarding
 
-Cada número que escribe se valida contra la pestaña `usuarios` de Google Sheets **antes** de procesar nada. La columna `estado` la edita únicamente el administrador:
+Cada número que escribe se valida contra la pestaña `usuarios` de Google Sheets **antes** de procesar nada. La columna `Estado` la edita únicamente el administrador:
 
-| `estado` | Comportamiento |
+| `Estado` | Comportamiento |
 | :---: | :--- |
 | `1` Aprobado | Registro de gastos: texto, audio (Groq Whisper) o imagen con descripción. Usa `EXTRACTION_SYSTEM_PROMPT`. |
 | `2` Rechazado | Mensaje estándar de acceso denegado; no se procesa nada. |
 | vacío / número nuevo | Onboarding (nombre y email, solo por texto) con `ONBOARDING_SYSTEM_PROMPT`. Se avisa que la cuenta requiere aprobación manual del administrador antes de poder registrar gastos. |
 
-Cualquier otro valor en `estado` se trata como vacío: nunca otorga acceso.
+Cualquier otro valor en `Estado` se trata como vacío: nunca otorga acceso.
 
 ```mermaid
 stateDiagram-v2
@@ -121,7 +138,7 @@ stateDiagram-v2
     state "Aprobado (estado 1)" as Aprobado
     state "Rechazado (estado 2)" as Rechazado
 
-    [*] --> Onboarding: escribe un número nuevo
+    [*] --> Onboarding: escribe un número nuevo y queda registrado
     Onboarding --> Pendiente: informa nombre y email
     Pendiente --> Aprobado: el admin carga 1
     Pendiente --> Rechazado: el admin carga 2
@@ -129,7 +146,8 @@ stateDiagram-v2
     Rechazado --> Aprobado: el admin cambia a 1
 ```
 
-- **Caché en memoria:** la lista de usuarios se lee de la hoja una vez cada `USER_CACHE_TTL_SECONDS` (60 s por defecto) y sirve a todos los mensajes, para no agotar la cuota de lectura de la API de Sheets. Aprobar o rechazar a alguien tarda hasta ese tiempo en aplicarse.
+- **Caché en memoria:** la lista de usuarios se lee de la hoja una vez cada `USER_CACHE_TTL_SECONDS` (60 s por defecto) y sirve a todos los mensajes, para no agotar la cuota de lectura de la API de Sheets.
+- **Aprobaciones en tiempo real (opcional):** con el [Apps Script](docs/apps_script_usuarios.md) instalado, aprobar o rechazar se aplica al instante y podés subir el TTL (por ejemplo a `3600`) para casi no leer la hoja. Sin él, el cambio tarda hasta el TTL en aplicarse.
 - **Prompts aislados:** el onboarding y la extracción de gastos usan prompts y ejemplos separados ([prompts.py](src/infrastructure/llm/prompts.py)); un usuario sin aprobar nunca llega al prompt de extracción.
 - **Un solo worker:** el control de duplicados, los locks por usuario y la caché viven en la memoria del proceso, así que ejecutá **un solo worker** de uvicorn (como hace el `Dockerfile`).
 - **Esquema de la pestaña:** [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-usuarios-control-de-acceso).
@@ -151,16 +169,22 @@ Para evitar alucinaciones, el LLM responde bajo un esquema estricto JSON. Este c
     "transaction_time": "21:15:00",
     "amount": 45000.00,
     "currency": "ARS",
-    "category": "ALIMENTACION",
+    "category": "Alimentación",
     "subcategory": "Restaurante",
     "merchant_name": "La Cabrera",
-    "payment_method": "CREDIT_CARD",
+    "payment_method": "Tarjeta de Crédito",
     "description": "Cena de negocios"
   }
 }
 ```
 
 > Consultá el esquema formal en [`docs/data_contract.json`](docs/data_contract.json).
+
+La taxonomía es **estrictamente en español** y `payment_method` es obligatorio:
+- **Categorías:** `Alimentación`, `Transporte`, `Vivienda`, `Servicios`, `Salud`, `Entretenimiento`, `Educación`, `Compras`, `Otros`.
+- **Medios de pago:** `Efectivo`, `Tarjeta de Crédito`, `Tarjeta de Débito`, `Transferencia`, `Billetera Virtual`, `No Especificado` (si el usuario no menciona cómo pagó).
+
+Se toleran diferencias de mayúsculas y tildes (`ALIMENTACION` → `Alimentación`), pero un valor fuera de la taxonomía se rechaza. Los enums, el prompt y el contrato JSON se mantienen sincronizados con un test.
 
 El onboarding tiene su propio contrato, definido en `ONBOARDING_SYSTEM_PROMPT`: `{"collected": {"full_name", "email"}, "reply"}`. El LLM solo extrae datos y redacta la próxima pregunta; el aviso final de aprobación manual es texto fijo.
 
@@ -170,20 +194,22 @@ El onboarding tiene su propio contrato, definido en `ONBOARDING_SYSTEM_PROMPT`: 
 
 ### Google Sheets (MVP)
 
-**Pestaña `raw_expenses`** (si está vacía, el bot crea los encabezados):
+**Pestaña `raw_expenses`** (si está vacía, el bot crea los encabezados; si tiene otra estructura, hay que reemplazarla por esta):
 
 | Columna | Descripción | Ejemplo |
 | :--- | :--- | :--- |
 | `timestamp` | Fecha y hora de ingesta, en la zona horaria `TIMEZONE` (`YYYY-MM-DD HH:mm:ss`) | `2026-10-19 22:50:00` |
+| `message_id` | ID único del mensaje de Evolution API: llave de idempotencia (sobrevive a reinicios) | `3EB0A1B2C3D4E5F60001` |
+| `user_phone_hash` | SHA-256 del número del remitente: vincula cada gasto con su dueño sin exponer el teléfono | `9f86d081884c7d65...` |
 | `fecha_gasto` | Fecha real del gasto resuelta por el LLM (por ejemplo, "ayer") | `2026-10-18` |
 | `monto` | Valor numérico con punto decimal | `4500.00` |
 | `moneda` | Código ISO 4217 | `ARS`, `USD` |
-| `categoria` | Taxonomía fija: `ALIMENTACION`, `TRANSPORTE`, `VIVIENDA`, `SERVICIOS`, `SALUD`, `ENTRETENIMIENTO`, `EDUCACION`, `COMPRAS`, `OTROS` | `ALIMENTACION` |
+| `categoria` | Taxonomía fija en español (ver arriba) | `Alimentación` |
+| `subcategoria` | Detalle granular extraído por el LLM | `Supermercado` |
+| `medio_de_pago` | Medio de pago en español (ver arriba) | `Tarjeta de Débito` |
 | `descripcion` | Detalle del gasto | `Almuerzo de trabajo` |
 
-> La hoja de gastos no guarda quién registró cada gasto. El registro completo, con `user_phone_hash`, solo se persiste en PostgreSQL.
-
-**Pestaña `usuarios`:** control de acceso, documentada en [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-usuarios-control-de-acceso).
+**Pestaña `usuarios`** (`Telefono`, `Nombre`, `Email`, `Estado`, `Fecha_Registro`): control de acceso, documentada junto con la anterior en [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-usuarios-control-de-acceso).
 
 ### PostgreSQL (`STORAGE_BACKEND=postgres`)
 
@@ -199,10 +225,10 @@ Tabla `raw_whatsapp.expenses`, definida en [postgres_repo.py](src/infrastructure
 | `transaction_time` | `TIME` (nulo) | Hora (`HH:mm:ss`) o vacío |
 | `amount` | `FLOAT` | Monto con punto decimal, redondeado a 2 decimales |
 | `currency` | `VARCHAR(3)` | Código ISO 4217 |
-| `category` | `VARCHAR(50)` | Taxonomía fija (ver arriba) |
+| `category` | `VARCHAR(50)` | Taxonomía fija en español (ver arriba) |
 | `subcategory` | `VARCHAR(50)` (nulo) | Clasificación detallada |
 | `merchant_name` | `VARCHAR(100)` (nulo) | Nombre del comercio o proveedor |
-| `payment_method` | `VARCHAR(30)` | `CASH`, `CREDIT_CARD`, `DEBIT_CARD`, `BANK_TRANSFER`, `CRYPTO`, `OTHER`, `UNKNOWN` |
+| `payment_method` | `VARCHAR(30)` | Medio de pago en español (ver arriba) |
 | `description` | `TEXT` | Detalle o concepto del gasto |
 | `confidence_score` | `FLOAT` | Puntuación de certeza de la extracción (0.00 - 1.00) |
 | `raw_text` | `TEXT` | Texto original / transcripción para auditoría |
@@ -213,14 +239,15 @@ Tabla `raw_whatsapp.expenses`, definida en [postgres_repo.py](src/infrastructure
 
 ## 🛡️ Reglas de Calidad de Datos
 
-Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7 viven en [`DataQualityGate`](src/services/data_quality.py):
+Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viven en [`DataQualityGate`](src/services/data_quality.py):
 1. **Acceso previo:** solo se procesan los mensajes de usuarios aprobados (estado `1`).
-2. **Idempotencia:** se descartan las reentregas del webhook (mismo `message_id`) y se valida que el mensaje no haya sido registrado ya (en memoria para Sheets, restricción única en PostgreSQL).
+2. **Idempotencia:** se descartan las reentregas del webhook (mismo `message_id`) y se valida que el mensaje no haya sido registrado ya: en Sheets contra la columna `message_id` (se lee una vez al arrancar, así que sobrevive a reinicios) y en PostgreSQL con una restricción única.
 3. **Confianza mínima:** si `confidence_score < 0.65`, el gasto no se guarda y se le pide al usuario que reenvíe el mensaje aclarando monto y concepto.
 4. **Monto:** debe ser mayor a 0 y se redondea a 2 decimales.
 5. **Moneda y fecha:** la moneda debe tener formato ISO 4217 (3 letras mayúsculas) y, si el usuario no menciona otra, se asume `ARS`. Una fecha futura genera una advertencia, no un rechazo.
 6. **Protección contra inyección de fórmulas:** si un campo de texto inicia con `=`, `+`, `-` o `@`, se antepone `'` para prevenir ejecución maliciosa en hojas de cálculo. El mismo tratamiento se aplica a los datos de onboarding.
-7. **Privacidad (PII):** el número telefónico se persiste hasheado (SHA-256) y los logs lo enmascaran.
+7. **Privacidad (PII):** el número telefónico se persiste hasheado (SHA-256) en `user_phone_hash` y los logs lo enmascaran. Los reportes filtran **solo** por ese hash.
+8. **Taxonomía en español:** la categoría y el medio de pago deben pertenecer a las listas de arriba; `payment_method` es obligatorio.
 
 ---
 
@@ -230,8 +257,10 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7 viv
 - **Python 3.11+** (o Docker).
 - **API key de Groq** (LLM y Whisper).
 - Una instancia de **Evolution API v2** con un número de WhatsApp vinculado por QR.
-- Cuenta de Servicio de Google Cloud (GCP) con la **Google Sheets API** habilitada.
-- Una URL a la que Evolution pueda llamar (en desarrollo, un túnel como ngrok).
+- Cuenta de Servicio de Google Cloud (GCP) con la **Google Sheets API** y la **Google Drive API** habilitadas.
+- Que Evolution pueda llamar al bot. Si corren en tu misma máquina no hace falta nada más (`localhost` o `host.docker.internal`); si Evolution está en otro servidor, necesitás una URL pública (o un túnel como ngrok).
+
+> 📘 **Guías detalladas, punta a punta y verificadas:** [instructivo Docker](docs/instructivo_docker.md) (bot y Evolution en contenedores) e [instructivo local](docs/instructivo_local.md) (bot con uvicorn; Evolution en Docker o nativo). Los pasos de abajo son el resumen.
 
 ### Pasos de Instalación
 1. **Clonar el repositorio:**
@@ -255,15 +284,18 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7 viv
    | `SPREADSHEET_ID` | ✅ | ID (o URL) del spreadsheet de Google. |
    | `WORKSHEET_NAME` | | Pestaña de gastos (por defecto `raw_expenses`). |
    | `USERS_WORKSHEET_NAME` | | Pestaña de usuarios (por defecto `usuarios`). |
-   | `USER_CACHE_TTL_SECONDS` | | Segundos que se cachea la lista de usuarios (por defecto `60`). |
+   | `USER_CACHE_TTL_SECONDS` | | Segundos que se cachea la lista de usuarios (por defecto `60`; con el Apps Script instalado podés subirlo a `3600`). |
+   | `SHEETS_WEBHOOK_SECRET` | | Secreto del Apps Script de aprobaciones en tiempo real. Sin él, `/api/v1/webhooks/sheets` rechaza todo. |
+   | `REPORTS_FOLDER_ID` | | Carpeta de Drive (compartida con los administradores) donde se crean los reportes. Si falta, quedan en el Drive de la cuenta de servicio. |
+   | `REPORT_COOLDOWN_SECONDS` | | Segundos mínimos entre dos reportes del mismo usuario (por defecto `300`). |
    | `GOOGLE_APPLICATION_CREDENTIALS` / `GCP_SERVICE_ACCOUNT_B64` | | Credenciales de la cuenta de servicio, si el `.json` no está en `config/credentials/` (donde se detecta solo). |
    | `STORAGE_BACKEND` | | `sheets` (por defecto) o `postgres`. |
    | `POSTGRES_*` | | Conexión a PostgreSQL, solo con `STORAGE_BACKEND=postgres`. |
    | `TIMEZONE` | | Zona horaria de los timestamps (por defecto `America/Argentina/Buenos_Aires`). |
 
 3. **Preparar Google Sheets:**
-   * Compartí el spreadsheet con el correo de la cuenta de servicio de GCP con rol de **Editor**.
-   * Creá la pestaña `raw_expenses` (los encabezados se crean solos si está vacía).
+   * Compartí el spreadsheet con el correo de la cuenta de servicio de GCP con rol de **Editor**, y habilitá la **Google Drive API** en su proyecto (para los reportes).
+   * Creá la pestaña `raw_expenses` (los 10 encabezados se crean solos si está vacía; si ya tiene otra estructura, reemplazala por la de [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-raw_expenses-registro-de-gastos)).
    * Creá la pestaña `usuarios` con los encabezados de [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-usuarios-control-de-acceso). Si no existe, el bot no puede verificar a nadie y rechaza todos los mensajes.
 4. **Levantar el servicio:**
    ```bash
@@ -306,8 +338,8 @@ python scripts/test_sheets_write.py # escribe una fila de prueba en la hoja de g
 
 1. Todos los cambios en prompts de extracción deben mantener compatibilidad con [`docs/data_contract.json`](docs/data_contract.json).
 2. Los prompts de onboarding (`ONBOARDING_*`) y de extracción (`EXTRACTION_*`) están aislados en [prompts.py](src/infrastructure/llm/prompts.py): no mezcles ejemplos entre ramas.
-3. No modifiques los nombres de columnas de las hojas sin actualizar el mapeo en el código: `ExpenseRecord.to_sheets_row()` en [models.py](src/domain/models.py) (gastos) y `HEADERS` en [sheets_users_repo.py](src/infrastructure/storage/sheets_users_repo.py) (usuarios), además de [docs/sheets_schema.md](docs/sheets_schema.md).
-4. Para sugerencias de nuevas categorías o métricas, abrí un *Issue* describiendo la justificación analítica. Una categoría nueva también debe agregarse a `CategoryEnum` y al prompt de extracción.
+3. No modifiques los nombres de columnas de las hojas sin actualizar el mapeo en el código: `EXPENSE_SHEET_HEADERS` y `ExpenseRecord.to_sheets_dict()` en [models.py](src/domain/models.py) (gastos) y `HEADERS` en [sheets_users_repo.py](src/infrastructure/storage/sheets_users_repo.py) (usuarios), además de [docs/sheets_schema.md](docs/sheets_schema.md) y del [Apps Script](apps_script/usuarios_onedit.gs).
+4. Para sugerencias de nuevas categorías o métricas, abrí un *Issue* describiendo la justificación analítica. Una categoría nueva también debe agregarse a `CategoryEnum`, al prompt de extracción y a `docs/data_contract.json` (un test verifica que los tres coincidan).
 5. Corré `pytest` antes de integrar cambios y usá siempre datos ficticios (números, nombres y emails) en tests, ejemplos y documentación.
 
 ---

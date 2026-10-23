@@ -39,7 +39,9 @@ def test_data_quality_gate_accepts_valid_record(sample_valid_llm_response):
     assert result.sanitized_record is not None
     assert result.sanitized_record.amount == 15.50
     assert result.sanitized_record.currency == "USD"
-    assert result.sanitized_record.category == "ALIMENTACION"
+    assert result.sanitized_record.category == "Alimentación"
+    assert result.sanitized_record.payment_method == "Tarjeta de Débito"
+    assert result.sanitized_record.subcategory == "Restaurante"
 
 
 def test_data_quality_gate_rejects_low_confidence():
@@ -55,7 +57,7 @@ def test_data_quality_gate_rejects_low_confidence():
             currency="USD",
             category=CategoryEnum.OTROS,
             subcategory="Otros",
-            payment_method=PaymentMethodEnum.UNKNOWN,
+            payment_method=PaymentMethodEnum.NO_ESPECIFICADO,
             description="Incierto",
         ),
     )

@@ -23,7 +23,7 @@ def sample_valid_llm_response() -> LLMExtractionResponse:
             category=CategoryEnum.ALIMENTACION,
             subcategory="Restaurante",
             merchant_name="Sushi Bar",
-            payment_method=PaymentMethodEnum.DEBIT_CARD,
+            payment_method=PaymentMethodEnum.TARJETA_DEBITO,
             description="Almuerzo de sushi",
         ),
     )

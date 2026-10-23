@@ -1,59 +1,94 @@
 # Google Sheets MVP Schema & Data Dictionary
 
-Esta hoja de cálculo actúa como almacenamiento temporal (Staging) para el MVP del bot de WhatsApp.
-Los nombres de columna están normalizados en `snake_case` estricto para facilitar la posterior ingesta y migración a SQL.
+El spreadsheet actúa como almacenamiento del MVP del bot de WhatsApp y tiene **dos pestañas obligatorias**: `raw_expenses` (gastos) y `usuarios` (control de acceso). Los nombres de columna están en `snake_case` y alineados con el diseño de la futura base PostgreSQL para facilitar la migración.
 
-## Columnas del MVP
+---
 
-| Orden | Nombre Columna | Tipo Lógico | Validación / Formato | Ejemplo |
+## Pestaña `raw_expenses` (registro de gastos)
+
+Nombre configurable con `WORKSHEET_NAME`. Si la pestaña está **vacía**, el bot crea la fila de encabezados; si ya tiene otra estructura, **hay que reemplazarla** por esta (el bot escribe por nombre de columna y, si falta alguna, se niega a guardar y lo informa en el log en vez de desalinear los datos).
+
+Fila de encabezados exacta (minúsculas):
+
+```
+timestamp, message_id, user_phone_hash, fecha_gasto, monto, moneda, categoria, subcategoria, medio_de_pago, descripcion
+```
+
+| Orden | Columna | Tipo lógico | Descripción | Ejemplo |
 | :---: | :--- | :--- | :--- | :--- |
-| 1 | `timestamp` | DATETIME | Fecha y hora exacta del registro (`YYYY-MM-DD HH:mm:ss`) | `2026-10-19 22:50:00` |
-| 2 | `monto` | NUMERIC(12,2)| Valor numérico puro (decimal con punto) | `4500.00` |
-| 3 | `moneda` | CHAR(3) | Código de moneda ISO 4217 | `ARS`, `USD` |
-| 4 | `categoria` | VARCHAR | Agrupación general | `Supermercado`, `Comida`, `Transporte` |
-| 5 | `descripcion` | TEXT | Detalle específico de la compra | `Compra semanal de provisiones` |
+| 1 | `timestamp` | DATETIME | Fecha y hora de ingesta, en la zona horaria `TIMEZONE` (`YYYY-MM-DD HH:mm:ss`) | `2026-10-19 22:50:00` |
+| 2 | `message_id` | TEXT | ID único del mensaje de Evolution API. Es la **llave de idempotencia**: evita registrar dos veces un mensaje reentregado, incluso después de reiniciar el bot | `3EB0A1B2C3D4E5F60001` |
+| 3 | `user_phone_hash` | TEXT (64) | Hash SHA-256 del número del remitente. **El número nunca se escribe en claro** en esta pestaña; el hash permite filtrar los gastos de cada persona | `9f86d081884c7d65...` |
+| 4 | `fecha_gasto` | DATE | Fecha real del gasto, resuelta por el LLM (por ejemplo, "ayer") | `2026-10-18` |
+| 5 | `monto` | NUMERIC | Valor numérico con punto decimal | `4500.00` |
+| 6 | `moneda` | CHAR(3) | Código ISO 4217 (`ARS` si el usuario no menciona otra) | `ARS`, `USD` |
+| 7 | `categoria` | TEXT | Categoría macro, **estrictamente en español** | `Alimentación` |
+| 8 | `subcategoria` | TEXT | Detalle granular extraído por el LLM | `Supermercado`, `Restaurante` |
+| 9 | `medio_de_pago` | TEXT | Medio de pago, **estrictamente en español** y obligatorio | `Tarjeta de Débito` |
+| 10 | `descripcion` | TEXT | Concepto o detalle del gasto | `Compra semanal de provisiones` |
 
-## Reglas de Integridad en Google Sheets
-1. No usar caracteres especiales en los encabezados.
-2. Formatear la columna `amount` como "Número" (sin símbolo de moneda para evitar strings mezclados).
-3. Formatear `transaction_date` como "Fecha" (`YYYY-MM-DD`).
+**Categorías permitidas:** `Alimentación`, `Transporte`, `Vivienda`, `Servicios`, `Salud`, `Entretenimiento`, `Educación`, `Compras`, `Otros`.
+
+**Medios de pago permitidos:** `Efectivo`, `Tarjeta de Crédito`, `Tarjeta de Débito`, `Transferencia`, `Billetera Virtual`, `No Especificado` (cuando el usuario no menciona cómo pagó).
+
+### Reglas de integridad
+1. No usar caracteres especiales en los encabezados; el orden de las columnas puede variar y se pueden agregar columnas propias, pero las 10 son obligatorias.
+2. Formatear `monto` como "Número" (sin símbolo de moneda).
+3. `message_id` y `user_phone_hash` se guardan como texto (el bot antepone un apóstrofe interno que Sheets no muestra) para que nunca se interpreten como números.
+4. Los textos libres que empiezan con `=`, `+`, `-` o `@` se guardan con un apóstrofe inicial para evitar inyección de fórmulas.
+5. Las filas anteriores a este esquema (sin `user_phone_hash`) no se atribuyen a ningún usuario: no aparecen en ningún reporte.
 
 ---
 
 ## Pestaña `usuarios` (control de acceso)
 
-Pestaña del mismo spreadsheet (nombre configurable con `USERS_WORKSHEET_NAME`, por defecto `usuarios`).
-El bot la consulta con cada número que le escribe por WhatsApp y **es el único lugar donde se aprueba o rechaza a una persona**.
-Debe existir antes de levantar el bot: si falta, el bot no puede verificar a nadie y rechaza todo (falla cerrado).
+Nombre configurable con `USERS_WORKSHEET_NAME`, por defecto `usuarios`. El bot la consulta con cada número que le escribe por WhatsApp y **es el único lugar donde se aprueba o rechaza a una persona**. Debe existir antes de levantar el bot: si falta, el bot no puede verificar a nadie y rechaza todos los mensajes (falla cerrado).
+
+Fila de encabezados (se compara sin distinguir mayúsculas):
+
+```
+Telefono, Nombre, Email, Estado, Fecha_Registro
+```
 
 | Orden | Columna | La escribe | Descripción | Ejemplo |
 | :---: | :--- | :--- | :--- | :--- |
-| 1 | `telefono` | bot / admin | Número con código de país. Se compara ignorando espacios, `+`, guiones y la diferencia `549`/`54` de móviles argentinos. Formatear la columna como "Texto sin formato". | `5491122334455` |
-| 2 | `estado` | **solo el admin** | `1` aprobado · `2` rechazado · vacío = desconocido / pendiente. | `1` |
-| 3 | `nombre_completo` | bot | Nombre y apellido informados durante el onboarding. | `Lucía Fernández` |
-| 4 | `email` | bot | Email informado durante el onboarding. | `lucia@example.com` |
-| 5 | `fecha_alta` | bot | Cuándo se recibió el primer dato (`YYYY-MM-DD HH:mm:ss`, hora local). | `2026-10-22 18:30:00` |
-| 6 | `fecha_actualizacion` | bot | Última vez que el bot modificó la fila. | `2026-10-22 18:32:10` |
+| 1 | `Telefono` | bot / admin | Número real con código de país. Se compara ignorando espacios, `+`, guiones y la diferencia `549`/`54` de móviles argentinos. Formatear la columna como "Texto sin formato". | `5491122334455` |
+| 2 | `Nombre` | bot | Nombre y apellido informados durante el onboarding | `Lucía Fernández` |
+| 3 | `Email` | bot | Correo informado en el onboarding (se pide preferentemente de Gmail). Es la cuenta con la que se comparten los reportes de Drive | `lucia@gmail.com` |
+| 4 | `Estado` | **solo el admin** | `1` aprobado · `2` rechazado · vacío = pendiente | `1` |
+| 5 | `Fecha_Registro` | bot | Timestamp que genera el backend al detectar el número por primera vez (`YYYY-MM-DD HH:mm:ss`, hora local) | `2026-10-22 18:30:00` |
 
-Fila de encabezados exacta (minúsculas): `telefono, estado, nombre_completo, email, fecha_alta, fecha_actualizacion`.
-El orden de las columnas puede variar y se pueden agregar columnas propias (ej. `notas`); `telefono` y `estado` son obligatorias.
+Se pueden agregar columnas propias (por ejemplo `Notas`) y cambiar el orden; `Telefono` y `Estado` son obligatorias. Las pestañas creadas con la primera versión del esquema (`nombre_completo`, `fecha_alta`, `fecha_actualizacion`) siguen funcionando.
 
 ### Estados
 
-| `estado` | Significado | Qué hace el bot |
+| `Estado` | Significado | Qué hace el bot |
 | :---: | :--- | :--- |
-| `1` | Aprobado | Deriva al flujo de registro de gastos (texto, audio con Whisper, imagen con descripción). |
+| `1` | Aprobado | Deriva al flujo de registro de gastos (texto, audio con Whisper, imagen con descripción) y a los reportes. |
 | `2` | Rechazado | Responde un mensaje estándar de acceso denegado y corta el flujo. No procesa nada. |
-| vacío / número nuevo | Desconocido | Inicia (o continúa) el onboarding y avisa que la cuenta requiere aprobación manual del administrador antes de poder registrar gastos. |
+| vacío | Pendiente | Inicia (o continúa) el onboarding y avisa que la cuenta requiere aprobación manual del administrador antes de poder registrar gastos. |
 
-Cualquier otro valor en `estado` (`3`, `aprobado`, texto libre…) se trata como vacío: **nunca otorga acceso**.
+Cualquier otro valor en `Estado` (`3`, `aprobado`, texto libre…) se trata como vacío: **nunca otorga acceso**.
 
 ### Flujo de alta
-1. Un número desconocido escribe → el bot le pide nombre y email (solo por texto) y los guarda en una fila nueva con `estado` vacío.
-2. Con los datos completos el bot avisa que la cuenta está pendiente; mientras `estado` siga vacío solo responde un recordatorio fijo.
-3. El administrador revisa la fila y completa `estado` con `1` o `2`. También puede pre-aprobar a alguien agregando una fila con su `telefono` y `estado` = `1`.
-4. El cambio se aplica en hasta `USER_CACHE_TTL_SECONDS` (60 s por defecto): el bot guarda la tabla en memoria para no agotar la cuota de lectura de la API de Sheets.
+1. Un número desconocido escribe → el bot lo **registra de inmediato** (fila nueva con `Telefono`, `Fecha_Registro` y `Estado` vacío) y le pide nombre y email (solo por texto).
+2. A medida que la persona responde, el bot completa `Nombre` y `Email` en esa misma fila. Con los datos completos avisa que la cuenta está pendiente; mientras `Estado` siga vacío solo responde un recordatorio fijo.
+3. El administrador revisa la fila y completa `Estado` con `1` o `2`. También puede pre-aprobar a alguien agregando una fila con su `Telefono` y `Estado` = `1`.
+4. El cambio se aplica **al instante** si está instalado el [Apps Script](apps_script_usuarios.md); si no, en hasta `USER_CACHE_TTL_SECONDS` (60 s por defecto): el bot guarda la tabla en memoria para no agotar la cuota de lectura de la API de Sheets.
 
 ### Privacidad
-La pestaña contiene teléfonos, nombres y emails en claro (necesarios para identificar a quien se aprueba): compartila solo con las personas que administran los accesos.
+La pestaña contiene teléfonos, nombres y emails en claro (necesarios para identificar a quien se aprueba): compartila solo con las personas que administran los accesos. Los emails se usan para compartir reportes: **el bot no verifica que la persona sea dueña de esa casilla**, así que el administrador debe confirmarlo al aprobar.
 El bot escribe estos valores sin interpretarlos (`RAW`) y antepone `'` a textos que empiecen con `=`, `+`, `-` o `@`, para evitar inyección de fórmulas / CSV.
+
+---
+
+## Reportes por demanda
+
+Un usuario aprobado que pide *"quiero mi resumen"* (por texto o por audio) recibe por WhatsApp el link a un Google Spreadsheet **nuevo** con sus gastos:
+
+1. El bot filtra `raw_expenses` por el `user_phone_hash` del remitente (nunca por otro dato: aislamiento estricto).
+2. La cuenta de servicio crea el spreadsheet (en la carpeta `REPORTS_FOLDER_ID` si está configurada) y lo comparte en **solo lectura** con el `Email` registrado en `usuarios`.
+3. El reporte incluye fecha, monto, moneda, categoría, subcategoría, medio de pago y descripción; nunca el `message_id` ni el hash.
+4. Hay un enfriamiento de `REPORT_COOLDOWN_SECONDS` (5 minutos) entre reportes del mismo usuario, porque cada uno crea un archivo nuevo en Drive.
+
+Requiere la **Google Drive API habilitada** en el proyecto de GCP de la cuenta de servicio.

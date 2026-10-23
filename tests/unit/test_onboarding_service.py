@@ -32,6 +32,11 @@ def llm(reply=None, **collected) -> OnboardingLLMResponse:
     return OnboardingLLMResponse(collected=OnboardingData(**collected), reply=reply)
 
 
+def data_saves(repo: FakeUserRepository) -> list:
+    """Saves that carry data (the empty first-contact registration is checked separately)."""
+    return [(phone, data) for phone, data in repo.saved if data != OnboardingData()]
+
+
 def build(users: dict = None):
     groq, repo, whatsapp = FakeGroq(), FakeUserRepository(users), FakeWhatsApp()
     return OnboardingService(groq, repo, whatsapp), groq, repo, whatsapp
@@ -44,7 +49,7 @@ async def test_first_contact_shows_the_llm_question_and_stores_nothing_yet():
     await service.handle(message("hola, gasté 500 en uber"), None)
 
     assert whatsapp.texts == ["¡Hola! ¿Cuál es tu nombre y apellido?"]
-    assert repo.saved == []  # nothing collected yet, so no row is created for a random number
+    assert data_saves(repo) == []  # nothing was collected yet
     assert groq.expense_calls == []  # never touches the expense extraction branch
 
 
@@ -54,7 +59,7 @@ async def test_partial_data_is_saved_and_the_next_question_is_asked():
 
     await service.handle(message("me llamo Lucía Fernández"), None)
 
-    assert repo.saved == [(PHONE, OnboardingData(full_name="Lucía Fernández"))]
+    assert data_saves(repo) == [(PHONE, OnboardingData(full_name="Lucía Fernández"))]
     assert whatsapp.texts == ["Gracias Lucía. ¿Y tu email?"]
 
 
@@ -77,7 +82,7 @@ async def test_completing_the_data_notifies_that_manual_approval_is_required():
 
     await service.handle(message("lucia@example.com"), existing)
 
-    assert repo.saved == [(PHONE, OnboardingData(full_name="Lucía Fernández", email="lucia@example.com"))]
+    assert data_saves(repo) == [(PHONE, OnboardingData(full_name="Lucía Fernández", email="lucia@example.com"))]
     assert whatsapp.texts == [PENDING_APPROVAL_MESSAGE]
     assert "aprobación manual del administrador" in PENDING_APPROVAL_MESSAGE
     assert "antes de poder registrar gastos" in PENDING_APPROVAL_MESSAGE
@@ -89,7 +94,7 @@ async def test_all_data_in_a_single_message_completes_the_onboarding():
 
     await service.handle(message("Soy Lucía Fernández, lucia@example.com"), None)
 
-    assert len(repo.saved) == 1
+    assert len(data_saves(repo)) == 1
     assert whatsapp.texts == [PENDING_APPROVAL_MESSAGE]
 
 
@@ -101,7 +106,7 @@ async def test_a_user_that_already_finished_waits_for_the_admin_without_any_llm_
 
     assert whatsapp.texts == [PENDING_REMINDER_MESSAGE]
     assert groq.onboarding_calls == []
-    assert repo.saved == []
+    assert data_saves(repo) == []
     assert ("typing_start", PHONE) not in whatsapp.events
 
 
@@ -113,7 +118,7 @@ async def test_onboarding_is_text_only_so_no_media_is_processed_for_unapproved_u
 
     assert "por mensaje de texto" in whatsapp.texts[0]
     assert groq.onboarding_calls == []
-    assert repo.saved == []
+    assert data_saves(repo) == []
 
 
 async def test_an_email_the_user_never_wrote_is_discarded():
@@ -122,7 +127,7 @@ async def test_an_email_the_user_never_wrote_is_discarded():
 
     await service.handle(message("soy Lucía Fernández"), None)
 
-    assert repo.saved == [(PHONE, OnboardingData(full_name="Lucía Fernández"))]
+    assert data_saves(repo) == [(PHONE, OnboardingData(full_name="Lucía Fernández"))]
     assert whatsapp.texts == ["¿Cuál es tu email?"]
 
 
@@ -132,7 +137,7 @@ async def test_user_provided_text_is_neutralized_against_formula_injection():
 
     await service.handle(message('=HYPERLINK("http://evil.example","click") x@example.com'), None)
 
-    saved = repo.saved[0][1]
+    saved = data_saves(repo)[0][1]
     assert saved.full_name.startswith("'=")
 
 
@@ -161,7 +166,7 @@ async def test_llm_failure_tells_the_user_to_retry_and_stores_nothing():
     await service.handle(message(), None)
 
     assert whatsapp.texts == [ONBOARDING_ERROR_MESSAGE]
-    assert repo.saved == []
+    assert data_saves(repo) == []
 
 
 async def test_storage_failure_does_not_pretend_the_data_was_saved():
@@ -173,3 +178,42 @@ async def test_storage_failure_does_not_pretend_the_data_was_saved():
 
     assert whatsapp.texts == [ONBOARDING_ERROR_MESSAGE]
     assert PENDING_APPROVAL_MESSAGE not in whatsapp.texts
+
+
+# ------------------------------------------------- first contact registers the number
+async def test_a_new_number_is_registered_in_the_users_sheet_at_first_contact_even_without_data():
+    service, groq, repo, whatsapp = build()
+    groq.onboarding_result = llm(reply="¿Cuál es tu nombre y apellido?")
+
+    await service.handle(message("hola"), None)
+
+    assert repo.saved[0] == (PHONE, OnboardingData())  # row created: the admin can see who wrote
+    assert PHONE in repo.users and repo.users[PHONE].status is None
+
+
+async def test_a_number_already_registered_is_not_registered_again():
+    existing = UserRecord(phone=PHONE, full_name="Lucía Fernández")
+    service, groq, repo, _ = build({PHONE: existing})
+
+    await service.handle(message("mi mail es lucia@example.com"), existing)
+
+    assert OnboardingData() not in [data for _, data in repo.saved]
+
+
+@pytest.mark.parametrize("input_type", [InputTypeEnum.AUDIO, InputTypeEnum.IMAGE])
+async def test_a_new_number_is_registered_even_if_its_first_message_is_not_text(input_type):
+    service, _, repo, _ = build()
+
+    await service.handle(message("", input_type), None)
+
+    assert repo.saved == [(PHONE, OnboardingData())]
+
+
+async def test_if_the_number_cannot_be_registered_the_user_is_asked_to_retry_and_the_llm_is_not_called():
+    service, groq, repo, whatsapp = build()
+    repo.fail_writes = True
+
+    await service.handle(message("hola"), None)
+
+    assert whatsapp.texts == [ONBOARDING_ERROR_MESSAGE]
+    assert groq.onboarding_calls == []
