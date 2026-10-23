@@ -28,6 +28,20 @@ class WhatsAppClient:
             logger.warning("WhatsApp credentials missing; skipping sending text message.")
             return False
 
+        # --- INICIO DEL PARCHE PARA ARGENTINA ---
+        if recipient_phone.startswith("549") and len(recipient_phone) == 13:
+            recipient_phone = recipient_phone.replace("549", "54", 1)
+        # --- FIN DEL PARCHE ---
+
+        url = f"{self.base_url}/{self.phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient_phone,
+            "type": "text",
+            "text": {"preview_url": False, "body": text},
+        }
+
         url = f"{self.base_url}/{self.phone_number_id}/messages"
         payload = {
             "messaging_product": "whatsapp",

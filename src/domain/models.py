@@ -79,9 +79,11 @@ class ExpenseRecord(BaseModel):
     ingested_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_sheets_row(self) -> list:
-        """Convert record to ordered list matching Google Sheets 5-column schema:
-        [timestamp, monto, moneda, categoria, descripcion]
-        converted to local timezone (default UTC-3 Argentina).
+        """Convert record to ordered list matching Google Sheets schema:
+        [timestamp, fecha_gasto, monto, moneda, categoria, descripcion]
+
+        - timestamp   : fecha y hora de ingesta del registro (UTC-3 Argentina)
+        - fecha_gasto : fecha real del gasto resuelto por el LLM (ej. 'ayer' → yesterday)
         """
         try:
             local_tz = ZoneInfo(settings.TIMEZONE)
@@ -91,8 +93,10 @@ class ExpenseRecord(BaseModel):
             local_dt = self.ingested_at_utc.astimezone(local_tz)
 
         timestamp_formatted = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+        fecha_gasto = self.transaction_date.isoformat()  # YYYY-MM-DD
         return [
-            timestamp_formatted,  # timestamp (UTC-3)
+            timestamp_formatted,  # timestamp de ingesta (UTC-3)
+            fecha_gasto,           # fecha_gasto (fecha real del gasto)
             self.amount,           # monto
             self.currency,         # moneda
             self.category,         # categoria

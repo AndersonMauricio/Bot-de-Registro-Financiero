@@ -78,6 +78,7 @@ class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
             if not values:
                 headers = [
                     "timestamp",
+                    "fecha_gasto",
                     "monto",
                     "moneda",
                     "categoria",
