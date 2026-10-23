@@ -231,7 +231,9 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7 viv
 - **API key de Groq** (LLM y Whisper).
 - Una instancia de **Evolution API v2** con un número de WhatsApp vinculado por QR.
 - Cuenta de Servicio de Google Cloud (GCP) con la **Google Sheets API** habilitada.
-- Una URL a la que Evolution pueda llamar (en desarrollo, un túnel como ngrok).
+- Que Evolution pueda llamar al bot. Si corren en tu misma máquina no hace falta nada más (`localhost` o `host.docker.internal`); si Evolution está en otro servidor, necesitás una URL pública (o un túnel como ngrok).
+
+> 📘 **Guías detalladas, punta a punta y verificadas:** [instructivo Docker](docs/instructivo_docker.md) (bot y Evolution en contenedores) e [instructivo local](docs/instructivo_local.md) (bot con uvicorn; Evolution en Docker o nativo). Los pasos de abajo son el resumen.
 
 ### Pasos de Instalación
 1. **Clonar el repositorio:**
