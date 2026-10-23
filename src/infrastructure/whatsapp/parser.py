@@ -1,8 +1,9 @@
-"""Parser for WhatsApp Cloud API webhook payloads."""
+"""Parser for Evolution API webhook payloads (`messages.upsert` events)."""
 
 from dataclasses import dataclass
 from typing import Optional
 from src.core.logging import logger
+from src.core.phone import normalize_phone
 from src.domain.enums import InputTypeEnum
 
 
@@ -14,38 +15,53 @@ class ParsedWhatsAppMessage:
     timestamp: str
     input_type: InputTypeEnum
     text_content: Optional[str] = None
-    media_id: Optional[str] = None
+    media_base64: Optional[str] = None
     mime_type: Optional[str] = None
 
 
 class WhatsAppPayloadParser:
-    """Extracts relevant message data from Meta WhatsApp Cloud API webhooks."""
+    """Extracts relevant message data from Evolution API webhooks."""
+
+    # JID servers that identify a person (1:1 chat); groups are @g.us, status is @broadcast, etc.
+    PHONE_JID_SERVERS = ("s.whatsapp.net", "c.us")
+    # Disappearing-message and view-once chats nest the real content under one of these keys
+    WRAPPER_KEYS = ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2")
 
     @staticmethod
-    def parse_webhook(payload: dict) -> Optional[ParsedWhatsAppMessage]:
-        """Extract first valid user message from payload."""
-        try:
-            entry = payload.get("entry", [])[0]
-            change = entry.get("changes", [])[0]
-            value = change.get("value", {})
-            messages = value.get("messages", [])
+    def is_messages_upsert(payload: dict) -> bool:
+        """The payload carries `messages.upsert`; the webhook config spells it MESSAGES_UPSERT."""
+        return str(payload.get("event", "")).lower().replace("_", ".") == "messages.upsert"
 
-            if not messages:
-                # Event might be status update (sent, delivered, read)
+    @classmethod
+    def parse_webhook(cls, payload: dict) -> Optional[ParsedWhatsAppMessage]:
+        """Extract the user message from a messages.upsert payload, or None if the bot must not answer it."""
+        try:
+            data = payload.get("data")
+            if isinstance(data, list):
+                data = data[0] if data else None
+            if not isinstance(data, dict):
                 return None
 
-            msg = messages[0]
-            msg_id = msg.get("id")
-            sender = msg.get("from")
-            timestamp = msg.get("timestamp")
-            msg_type = msg.get("type")
+            key = data.get("key") or {}
+            if key.get("fromMe"):
+                # Evolution also emits our own outgoing messages; answering them would loop forever
+                return None
 
+            msg_id = key.get("id")
+            sender = cls._sender_phone(key)
             if not (msg_id and sender):
                 return None
 
+            raw_message = data.get("message") or {}
+            message = cls._unwrap(raw_message)
+            timestamp = str(data.get("messageTimestamp", ""))
+
             # 1. Text Message
-            if msg_type == "text":
-                body = msg.get("text", {}).get("body", "").strip()
+            if "conversation" in message or "extendedTextMessage" in message:
+                body = message.get("conversation") or (message.get("extendedTextMessage") or {}).get("text")
+                body = (body or "").strip()
+                if not body:
+                    return None
                 return ParsedWhatsAppMessage(
                     message_id=msg_id,
                     sender_phone=sender,
@@ -54,39 +70,60 @@ class WhatsAppPayloadParser:
                     text_content=body,
                 )
 
-            # 2. Audio or Voice Note
-            if msg_type in ("audio", "voice"):
-                audio_data = msg.get(msg_type, {})
-                media_id = audio_data.get("id")
-                mime_type = audio_data.get("mime_type", "audio/ogg")
+            # 2. Audio or Voice Note (base64 is inline when the webhook is configured with base64=true)
+            if "audioMessage" in message:
+                audio_data = message.get("audioMessage") or {}
                 return ParsedWhatsAppMessage(
                     message_id=msg_id,
                     sender_phone=sender,
                     timestamp=timestamp,
                     input_type=InputTypeEnum.AUDIO,
-                    media_id=media_id,
-                    mime_type=mime_type,
+                    media_base64=raw_message.get("base64") or None,
+                    mime_type=audio_data.get("mimetype", "audio/ogg"),
                 )
 
             # 3. Image / Ticket
-            if msg_type == "image":
-                image_data = msg.get("image", {})
-                media_id = image_data.get("id")
-                caption = image_data.get("caption", "")
-                mime_type = image_data.get("mime_type", "image/jpeg")
+            if "imageMessage" in message:
+                image_data = message.get("imageMessage") or {}
                 return ParsedWhatsAppMessage(
                     message_id=msg_id,
                     sender_phone=sender,
                     timestamp=timestamp,
                     input_type=InputTypeEnum.IMAGE,
-                    media_id=media_id,
-                    mime_type=mime_type,
-                    text_content=caption,
+                    text_content=(image_data.get("caption") or "").strip(),
+                    mime_type=image_data.get("mimetype", "image/jpeg"),
                 )
 
-            logger.info(f"Ignored unsupported WhatsApp message type: {msg_type}")
+            logger.info(f"Ignored unsupported WhatsApp message type: {data.get('messageType')}")
             return None
 
-        except (IndexError, KeyError, AttributeError) as e:
+        except (AttributeError, IndexError, KeyError, TypeError) as e:
             logger.warning(f"Error parsing WhatsApp webhook payload structure: {e}")
             return None
+
+    @classmethod
+    def _sender_phone(cls, key: dict) -> Optional[str]:
+        """Digits of the 1:1 chat's phone. Groups, status broadcasts and unresolvable LIDs yield None."""
+        jid = key.get("remoteJid") or ""
+        if jid.endswith("@lid"):
+            # WhatsApp "linked ID": the real number, when known, travels in an alternate field
+            jid = key.get("remoteJidAlt") or key.get("senderPn") or ""
+            if not jid:
+                logger.warning("Ignored message from a LID contact whose phone number could not be resolved.")
+                return None
+        user, _, server = jid.partition("@")
+        if server not in cls.PHONE_JID_SERVERS:
+            return None
+        return normalize_phone(user.split(":")[0]) or None  # strip the ":<device>" suffix
+
+    @classmethod
+    def _unwrap(cls, message: dict) -> dict:
+        for _ in range(3):  # wrappers can be stacked, but never deeply
+            for wrapper in cls.WRAPPER_KEYS:
+                inner = (message.get(wrapper) or {}).get("message")
+                if isinstance(inner, dict):
+                    message = inner
+                    break
+            else:
+                return message
+        return message

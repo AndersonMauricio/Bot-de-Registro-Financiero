@@ -5,11 +5,14 @@ from fastapi import Depends
 from src.core.config import Settings, settings
 from src.infrastructure.audio.whisper_client import WhisperClient
 from src.infrastructure.llm.groq_client import GroqLLMClient
-from src.infrastructure.storage.base import ExpenseRepositoryInterface
+from src.infrastructure.storage.base import ExpenseRepositoryInterface, UserRepositoryInterface
 from src.infrastructure.storage.postgres_repo import PostgresExpenseRepository
 from src.infrastructure.storage.sheets_repo import GoogleSheetsExpenseRepository
-from src.infrastructure.whatsapp.client import WhatsAppClient
+from src.infrastructure.storage.sheets_users_repo import GoogleSheetsUserRepository
+from src.infrastructure.whatsapp.client import EvolutionAPIClient
 from src.services.expense_service import ExpenseProcessingService
+from src.services.message_router import MessageRouter
+from src.services.onboarding_service import OnboardingService
 
 
 @lru_cache()
@@ -31,9 +34,9 @@ def get_groq_client() -> GroqLLMClient:
 
 
 @lru_cache()
-def get_whatsapp_client() -> WhatsAppClient:
-    """Return singleton instance of WhatsAppClient."""
-    return WhatsAppClient()
+def get_whatsapp_client() -> EvolutionAPIClient:
+    """Return singleton instance of the Evolution API client."""
+    return EvolutionAPIClient()
 
 
 @lru_cache()
@@ -45,6 +48,12 @@ def get_expense_repository() -> ExpenseRepositoryInterface:
     return GoogleSheetsExpenseRepository()
 
 
+@lru_cache()
+def get_user_repository() -> UserRepositoryInterface:
+    """Users always live in Google Sheets (cached in memory), whichever backend stores the expenses."""
+    return GoogleSheetsUserRepository()
+
+
 def get_expense_service() -> ExpenseProcessingService:
     """Construct ExpenseProcessingService with injected dependencies."""
     return ExpenseProcessingService(
@@ -52,4 +61,21 @@ def get_expense_service() -> ExpenseProcessingService:
         groq_client=get_groq_client(),
         repository=get_expense_repository(),
         whatsapp_client=get_whatsapp_client(),
+    )
+
+
+@lru_cache()
+def get_message_router() -> MessageRouter:
+    """Return the singleton router (it keeps the duplicate-delivery cache and per-sender locks)."""
+    whatsapp_client = get_whatsapp_client()
+    user_repository = get_user_repository()
+    return MessageRouter(
+        user_repository=user_repository,
+        expense_service=get_expense_service(),
+        onboarding_service=OnboardingService(
+            groq_client=get_groq_client(),
+            user_repository=user_repository,
+            whatsapp_client=whatsapp_client,
+        ),
+        whatsapp_client=whatsapp_client,
     )

@@ -1,12 +1,15 @@
 """Domain entities and data contracts using Pydantic v2."""
 
+import re
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, field_validator
 from src.core.config import settings
-from src.domain.enums import CategoryEnum, InputTypeEnum, PaymentMethodEnum
+from src.domain.enums import CategoryEnum, InputTypeEnum, PaymentMethodEnum, UserStatusEnum
+
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class ExtractionMetadata(BaseModel):
@@ -111,3 +114,75 @@ class DataQualityResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     sanitized_record: Optional[ExpenseRecord] = None
+
+
+class OnboardingData(BaseModel):
+    """Registration fields collected from an unknown user before an administrator reviews the account."""
+    full_name: Optional[str] = Field(default=None, description="Nombre y apellido")
+    email: Optional[str] = Field(default=None, description="Correo electrónico")
+
+    # Invalid values are dropped (not raised) so the bot simply asks for the field again.
+    @field_validator("full_name", mode="before")
+    @classmethod
+    def clean_full_name(cls, v: Any) -> Optional[str]:
+        if not isinstance(v, str):
+            return None
+        name = " ".join(v.split())
+        if len(name) < 2 or not any(c.isalpha() for c in name):
+            return None
+        return name[:120]
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def clean_email(cls, v: Any) -> Optional[str]:
+        if not isinstance(v, str):
+            return None
+        email = v.strip().lower()
+        return email if len(email) <= 254 and EMAIL_REGEX.match(email) else None
+
+    def missing_fields(self) -> list[str]:
+        """Names of the required fields that are still empty."""
+        return [name for name in ("full_name", "email") if not getattr(self, name)]
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.missing_fields()
+
+    def merged_with(self, newer: "OnboardingData") -> "OnboardingData":
+        """Combine with newly collected data; non-empty new values win (the user may correct a previous answer)."""
+        return OnboardingData(
+            full_name=newer.full_name or self.full_name,
+            email=newer.email or self.email,
+        )
+
+
+class OnboardingLLMResponse(BaseModel):
+    """Top-level contract expected from the onboarding LLM branch."""
+    collected: OnboardingData = Field(default_factory=OnboardingData)
+    reply: Optional[str] = Field(default=None, description="Next question for the user, null when nothing is missing")
+
+    @field_validator("collected", mode="before")
+    @classmethod
+    def collected_defaults_to_empty(cls, v: Any) -> Any:
+        return {} if v is None else v
+
+    @field_validator("reply", mode="before")
+    @classmethod
+    def clean_reply(cls, v: Any) -> Optional[str]:
+        if not isinstance(v, str):
+            return None
+        return v.strip() or None
+
+
+class UserRecord(BaseModel):
+    """Entry of the users sheet that drives access control and onboarding."""
+    phone: str = Field(..., description="Digits-only WhatsApp number")
+    status: Optional[UserStatusEnum] = Field(
+        default=None,
+        description="1 = approved, 2 = rejected, None = unknown / pending approval",
+    )
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+
+    def onboarding_data(self) -> OnboardingData:
+        return OnboardingData(full_name=self.full_name, email=self.email)

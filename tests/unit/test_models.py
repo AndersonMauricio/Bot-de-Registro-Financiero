@@ -28,8 +28,9 @@ def test_expense_record_to_sheets_row():
 
     row = record.to_sheets_row()
 
-    assert len(row) == 5
-    assert row[1] == 120.75               # monto
-    assert row[2] == "USD"                # moneda
-    assert row[3] == "TRANSPORTE"         # categoria
-    assert row[4] == "Viaje al aeropuerto" # descripcion
+    assert len(row) == 6
+    assert row[1] == "2026-10-19"         # fecha_gasto
+    assert row[2] == 120.75               # monto
+    assert row[3] == "USD"                # moneda
+    assert row[4] == "TRANSPORTE"         # categoria
+    assert row[5] == "Viaje al aeropuerto" # descripcion

@@ -14,6 +14,10 @@ async def lifespan(app: FastAPI):
     """Application startup and shutdown events."""
     logger.info(f"Starting {settings.APP_NAME} in [{settings.ENVIRONMENT}] mode.")
     logger.info(f"Storage backend active: '{settings.STORAGE_BACKEND}'")
+    if not (settings.EVOLUTION_API_KEY.get_secret_value() and settings.EVOLUTION_INSTANCE):
+        logger.warning("Evolution API is not configured (EVOLUTION_API_KEY / EVOLUTION_INSTANCE): replies are disabled.")
+    if not settings.EVOLUTION_WEBHOOK_SECRET.get_secret_value():
+        logger.warning("EVOLUTION_WEBHOOK_SECRET is not set: every webhook call will be rejected.")
     yield
     logger.info("Shutting down application cleanly.")
 
@@ -47,7 +51,7 @@ async def root():
         "endpoints": {
             "docs": "/docs",
             "health": "/api/v1/health",
-            "whatsapp_webhook": "/api/v1/webhooks/whatsapp",
+            "evolution_webhook": "/api/v1/webhooks/evolution",
         },
     }
 

@@ -30,5 +30,5 @@ class StorageError(BotWppException):
 
 
 class WhatsAppClientError(BotWppException):
-    """Raised when interaction with WhatsApp Cloud API fails."""
+    """Raised when interaction with the WhatsApp gateway (Evolution API) fails."""
     pass

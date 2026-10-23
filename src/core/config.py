@@ -29,11 +29,12 @@ class Settings(BaseSettings):
     GROQ_LLM_MODEL: str = Field(default="openai/gpt-oss-20b")
     GROQ_WHISPER_MODEL: str = Field(default="whisper-large-v3")
 
-    # WhatsApp Cloud API Config
-    WHATSAPP_TOKEN: SecretStr = Field(default=SecretStr(""))
-    WHATSAPP_PHONE_NUMBER_ID: str = Field(default="")
-    WHATSAPP_VERIFY_TOKEN: str = Field(default="secret_verify_token")
-    WHATSAPP_API_VERSION: str = Field(default="v20.0")
+    # Evolution API (WhatsApp gateway)
+    EVOLUTION_API_URL: str = Field(default="http://localhost:8080")
+    EVOLUTION_API_KEY: SecretStr = Field(default=SecretStr(""))
+    EVOLUTION_INSTANCE: str = Field(default="")
+    # Shared secret Evolution sends in the `x-webhook-secret` header (set via scripts/setup_evolution_webhook.py)
+    EVOLUTION_WEBHOOK_SECRET: SecretStr = Field(default=SecretStr(""))
 
     # Google Sheets Integration (MVP)
     # Allows specifying path or base64 encoded service account json
@@ -66,6 +67,16 @@ class Settings(BaseSettings):
     @classmethod
     def clean_worksheet_name(cls, v: str) -> str:
         return v.strip() if v else "raw_expenses"
+
+    # Users access control (tab in the same spreadsheet): 1 = approved, 2 = rejected, empty = unknown/pending
+    USERS_WORKSHEET_NAME: str = Field(default="usuarios")
+    # How long the users table is served from memory before re-reading the sheet (Sheets read quota)
+    USER_CACHE_TTL_SECONDS: int = Field(default=60, ge=1)
+
+    @field_validator("USERS_WORKSHEET_NAME")
+    @classmethod
+    def clean_users_worksheet_name(cls, v: str) -> str:
+        return v.strip() if v else "usuarios"
 
     # Storage Backend Selector ("sheets" | "postgres")
     STORAGE_BACKEND: str = Field(default="sheets")

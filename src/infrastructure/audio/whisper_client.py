@@ -8,6 +8,28 @@ from src.core.exceptions import TranscriptionError
 from src.core.logging import logger
 
 
+# Groq infers the audio format from the file extension; WhatsApp sends voice notes as ogg/opus
+_AUDIO_EXTENSIONS = {
+    "audio/ogg": "ogg",
+    "audio/opus": "opus",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/m4a": "m4a",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/webm": "webm",
+    "audio/flac": "flac",
+}
+
+
+def audio_filename_for_mime(mime_type: Optional[str]) -> str:
+    """File name with the extension Groq needs, from a mime type such as 'audio/ogg; codecs=opus'."""
+    base = (mime_type or "").split(";")[0].strip().lower()
+    return f"audio.{_AUDIO_EXTENSIONS.get(base, 'ogg')}"
+
+
 class WhisperClient:
     """Client for fast speech-to-text transcription using Whisper on Groq."""
 

@@ -32,3 +32,9 @@ class InputTypeEnum(str, Enum):
     TEXT = "TEXT"
     AUDIO = "AUDIO"
     IMAGE = "IMAGE"
+
+
+class UserStatusEnum(int, Enum):
+    """Access state stored in the users sheet. An empty cell (unknown / pending) is represented by None."""
+    APPROVED = 1
+    REJECTED = 2

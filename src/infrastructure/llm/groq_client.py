@@ -1,13 +1,21 @@
 import json
 import re
 from datetime import date
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 from groq import Groq
 from src.core.config import settings
 from src.core.exceptions import ExtractionError
 from src.core.logging import logger
-from src.domain.models import LLMExtractionResponse
-from src.infrastructure.llm.prompts import EXTRACTION_SYSTEM_PROMPT, FEW_SHOT_EXAMPLES
+from src.domain.models import LLMExtractionResponse, OnboardingData, OnboardingLLMResponse
+from src.infrastructure.llm.prompts import (
+    EXTRACTION_SYSTEM_PROMPT,
+    FEW_SHOT_EXAMPLES,
+    ONBOARDING_FEW_SHOT_EXAMPLES,
+    ONBOARDING_SYSTEM_PROMPT,
+    build_onboarding_user_prompt,
+)
+
+T = TypeVar("T")
 
 
 class GroqLLMClient:
@@ -92,28 +100,10 @@ class GroqLLMClient:
 
         raise json.JSONDecodeError("No valid JSON object found in response", content, 0)
 
-    def extract_expense_entities(
-        self,
-        text: str,
-        reference_date: Optional[date] = None,
-        default_currency: str = "USD",
-    ) -> LLMExtractionResponse:
-        """Send message text to Llama 3 via Groq and parse structured response."""
+    def _complete_json(self, messages: list[dict], parse: Callable[[dict], T]) -> T:
+        """Run a chat completion across candidate models until one yields JSON that `parse` accepts."""
         if not self.client:
             raise ExtractionError("Groq client is not initialized due to missing GROQ_API_KEY.")
-
-        ref_date = reference_date or date.today()
-        user_prompt = (
-            f"Fecha de referencia actual: {ref_date.isoformat()}\n"
-            f"Moneda por defecto si no se explicita: {default_currency}\n"
-            f"Texto o Transcripción recibida: '{text}'"
-        )
-
-        messages = [
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            *FEW_SHOT_EXAMPLES,
-            {"role": "user", "content": user_prompt},
-        ]
 
         candidate_models = self._get_candidate_models()
 
@@ -138,11 +128,7 @@ class GroqLLMClient:
                     if not response_content:
                         continue
 
-                    parsed_json = self._clean_and_parse_json(response_content)
-                    if "metadata" in parsed_json and "raw_text" not in parsed_json["metadata"]:
-                        parsed_json["metadata"]["raw_text"] = text
-
-                    return LLMExtractionResponse.model_validate(parsed_json)
+                    return parse(self._clean_and_parse_json(response_content))
 
                 except Exception as e:
                     last_error = e
@@ -157,3 +143,49 @@ class GroqLLMClient:
 
         logger.error(f"All candidate Groq models failed. Last error: {last_error}")
         raise ExtractionError(f"Groq API extraction failed: {last_error}") from last_error
+
+    def extract_expense_entities(
+        self,
+        text: str,
+        reference_date: Optional[date] = None,
+        default_currency: str = "ARS",
+    ) -> LLMExtractionResponse:
+        """Expense branch (approved users only): send message text to Groq and parse the structured response."""
+        ref_date = reference_date or date.today()
+        user_prompt = (
+            f"Fecha de referencia actual: {ref_date.isoformat()}\n"
+            f"Moneda por defecto si no se explicita: {default_currency}\n"
+            f"Texto o Transcripción recibida: '{text}'"
+        )
+
+        messages = [
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            *FEW_SHOT_EXAMPLES,
+            {"role": "user", "content": user_prompt},
+        ]
+
+        def parse(parsed_json: dict) -> LLMExtractionResponse:
+            if "metadata" in parsed_json and "raw_text" not in parsed_json["metadata"]:
+                parsed_json["metadata"]["raw_text"] = text
+            return LLMExtractionResponse.model_validate(parsed_json)
+
+        return self._complete_json(messages, parse)
+
+    def collect_onboarding_data(self, text: str, collected: OnboardingData) -> OnboardingLLMResponse:
+        """Onboarding branch (unknown users only): extract registration data and draft the next question.
+
+        Uses its own system prompt and examples; it never touches the expense extraction prompt.
+        """
+        user_prompt = build_onboarding_user_prompt(
+            collected_json=collected.model_dump_json(),
+            missing_fields=collected.missing_fields(),
+            text=text,
+        )
+
+        messages = [
+            {"role": "system", "content": ONBOARDING_SYSTEM_PROMPT},
+            *ONBOARDING_FEW_SHOT_EXAMPLES,
+            {"role": "user", "content": user_prompt},
+        ]
+
+        return self._complete_json(messages, OnboardingLLMResponse.model_validate)
