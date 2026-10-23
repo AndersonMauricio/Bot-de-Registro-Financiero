@@ -45,6 +45,8 @@ flowchart LR
    | `EVOLUTION_INSTANCE` | `bot-wpp` | El nombre que le des a la instancia en el Paso 3. |
    | `EVOLUTION_WEBHOOK_SECRET` | una clave larga aleatoria | `python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
 
+   Opcionales: `SHEETS_WEBHOOK_SECRET` (aprobaciones en tiempo real, requiere una URL pública: ver [apps_script_usuarios.md](apps_script_usuarios.md)), `REPORTS_FOLDER_ID` y `REPORT_COOLDOWN_SECONDS`.
+
    El resto (`GROQ_API_KEY`, `GOOGLE_SHEETS_SHEET_ID` o `SPREADSHEET_ID`, `GOOGLE_SHEETS_TAB_NAME` o `WORKSHEET_NAME`) ya debería estar. Las variables viejas `N8N_*`, `WEBHOOK_URL` y `WHATSAPP_*` no se usan más: podés borrarlas (y revocar el token de Meta).
 
    > Los valores del `.env` son para correr en tu máquina. Si más adelante corrés el bot en Docker, `EVOLUTION_API_URL` pasa a ser `http://host.docker.internal:8080`.
@@ -52,10 +54,14 @@ flowchart LR
    - Compartí la hoja (rol **Editor**) con el `client_email` de la cuenta de servicio: `grep client_email config/credentials/*.json`.
    - Creá la pestaña **`usuarios`** con los encabezados de [sheets_schema.md](sheets_schema.md#pestaña-usuarios-control-de-acceso). En macOS podés copiarlos y pegarlos en `A1`:
      ```bash
-     printf 'telefono\testado\tnombre_completo\temail\tfecha_alta\tfecha_actualizacion\n' | pbcopy
+     printf 'Telefono\tNombre\tEmail\tEstado\tFecha_Registro\n' | pbcopy
      ```
      Si la pestaña no existe, el bot no puede verificar a nadie y rechaza todos los mensajes.
-   - La pestaña de gastos (`raw_expenses` por defecto) tiene que existir; si está vacía el bot crea sus encabezados.
+   - La pestaña de gastos (`raw_expenses` por defecto) tiene que existir. Si está vacía, el bot crea sus 10 encabezados; si ya tiene otra estructura (por ejemplo la de la versión anterior), **reemplazala** por la de [sheets_schema.md](sheets_schema.md#pestaña-raw_expenses-registro-de-gastos), porque si falta alguna columna el bot se niega a guardar. En macOS:
+     ```bash
+     printf 'timestamp\tmessage_id\tuser_phone_hash\tfecha_gasto\tmonto\tmoneda\tcategoria\tsubcategoria\tmedio_de_pago\tdescripcion\n' | pbcopy
+     ```
+   - Para los **reportes** habilitá la **Google Drive API** en el proyecto de GCP de la cuenta de servicio (y, opcionalmente, `REPORTS_FOLDER_ID` en el `.env`).
 
 ## 🚀 Paso a paso
 
@@ -178,6 +184,8 @@ Mirá la terminal del bot y, **desde el segundo teléfono**, escribile al númer
 3. Esperá hasta **60 segundos** (el bot cachea la lista de usuarios) y mandá *"Gasté 15 USD en almuerzo con débito"* → responde "✅ Gasto Registrado con Éxito" y aparece una fila en `raw_expenses`.
 4. Mandá una **nota de voz** con un gasto: se transcribe con Whisper y se registra igual.
 5. Cambiá `estado` a **`2`** (rechazado), esperá la caché y escribí de nuevo → responde "⛔ Acceso denegado".
+
+6. Pedí tu **reporte** escribiendo *"quiero mi resumen"* (o por audio): el bot responde con el link a un Google Spreadsheet con **solo tus gastos**, compartido en solo lectura con el email que dejaste en el onboarding. Hay un enfriamiento de 5 minutos entre reportes.
 
 Mientras Groq procesa, el chat muestra "escribiendo…".
 

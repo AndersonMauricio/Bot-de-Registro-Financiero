@@ -14,15 +14,19 @@ from src.infrastructure.storage.sheets_users_repo import HEADERS, GoogleSheetsUs
 from src.infrastructure.whatsapp.client import EvolutionAPIClient
 from src.main import app
 from src.services.expense_service import ExpenseProcessingService
+from src.services.report_service import ReportService
+from src.infrastructure.cache.ttl_cache import TTLCache
+from src.api.v1.dependencies import get_user_repository
 from src.services.message_router import ACCESS_DENIED_MESSAGE, MessageRouter
 from src.services.onboarding_service import (
     PENDING_APPROVAL_MESSAGE,
     PENDING_REMINDER_MESSAGE,
     OnboardingService,
 )
-from tests.fakes import FakeClock, FakeExpenseRepository, FakeGroq, FakeWhisper, FakeWorksheet
+from tests.fakes import FakeClock, FakeExpenseRepository, FakeGroq, FakeReportPublisher, FakeWhisper, FakeWorksheet
 
 SECRET = "e2e-secret"
+SHEETS_SECRET = "e2e-sheets-secret"
 PHONE = "5491122334455"
 URL = "/api/v1/webhooks/evolution"
 
@@ -62,17 +66,21 @@ def system(sample_valid_llm_response):
         transport=httpx.MockTransport(gateway),
     )
     users = GoogleSheetsUserRepository(worksheet=worksheet, clock=clock)
+    publisher = FakeReportPublisher()
+    reports = ReportService(expenses, users, publisher, cooldown=TTLCache(300, clock=clock))
     router = MessageRouter(
         user_repository=users,
-        expense_service=ExpenseProcessingService(FakeWhisper(), groq, expenses, whatsapp),
+        expense_service=ExpenseProcessingService(FakeWhisper(), groq, expenses, whatsapp, report_service=reports),
         onboarding_service=OnboardingService(groq, users, whatsapp),
         whatsapp_client=whatsapp,
     )
 
     app.dependency_overrides[get_settings] = lambda: Settings(
-        _env_file=None, EVOLUTION_WEBHOOK_SECRET=SECRET, EVOLUTION_INSTANCE="test-instance"
+        _env_file=None, EVOLUTION_WEBHOOK_SECRET=SECRET, EVOLUTION_INSTANCE="test-instance",
+        SHEETS_WEBHOOK_SECRET=SHEETS_SECRET,
     )
     app.dependency_overrides[get_message_router] = lambda: router
+    app.dependency_overrides[get_user_repository] = lambda: users
     client = TestClient(app)
     counter = iter(range(1, 1000))
 
@@ -90,6 +98,13 @@ def system(sample_valid_llm_response):
         response = client.post(URL, json=payload, headers={"x-webhook-secret": SECRET})
         assert response.status_code == 200
 
+    def sheets_event(**payload):
+        response = client.post("/api/v1/webhooks/sheets", json=payload, headers={"x-webhook-secret": SHEETS_SECRET})
+        assert response.status_code == 200
+        return response.json()
+
+    send.sheets_event = sheets_event
+    send.publisher = publisher
     yield send, gateway, worksheet, clock, groq, expenses
     app.dependency_overrides.clear()
 
@@ -102,7 +117,9 @@ def test_full_lifecycle_unknown_user_onboarding_manual_approval_expense_and_reje
     send("hola, gasté 500 en uber")
     assert gateway.sent_texts() == ["¡Hola! ¿Cuál es tu nombre y apellido?"]
     assert expenses.saved == [] and groq.expense_calls == []
-    assert len(worksheet.rows) == 1  # header only: no row for a number that gave no data yet
+    # the number is registered at first contact (Fecha_Registro set), with no data and no estado
+    assert len(worksheet.rows) == 2
+    assert worksheet.rows[1][:4] == [PHONE, "", "", ""] and worksheet.rows[1][4] != ""
 
     # "Escribiendo..." was sent while Groq worked, and before the reply
     first_presence = next(i for i, (e, _) in enumerate(gateway.calls) if e == "chat/sendPresence")
@@ -115,11 +132,12 @@ def test_full_lifecycle_unknown_user_onboarding_manual_approval_expense_and_reje
         collected=OnboardingData(full_name="Lucía Fernández"), reply="Gracias Lucía. ¿Cuál es tu email?"
     )
     send("me llamo Lucía Fernández")
-    assert worksheet.rows[1][:4] == [PHONE, "", "Lucía Fernández", ""]
+    assert worksheet.rows[1][:4] == [PHONE, "Lucía Fernández", "", ""]
 
     groq.onboarding_result = OnboardingLLMResponse(collected=OnboardingData(email="lucia@example.com"))
     send("lucia@example.com")
-    assert worksheet.rows[1][:4] == [PHONE, "", "Lucía Fernández", "lucia@example.com"]
+    assert worksheet.rows[1][:4] == [PHONE, "Lucía Fernández", "lucia@example.com", ""]
+    assert len(worksheet.rows) == 2  # still one row for this person
     assert gateway.sent_texts()[-1] == PENDING_APPROVAL_MESSAGE
 
     # --- Still pending: no more LLM calls, just a reminder. Expenses are still refused.
@@ -130,7 +148,7 @@ def test_full_lifecycle_unknown_user_onboarding_manual_approval_expense_and_reje
     assert expenses.saved == []
 
     # --- State 1: the administrator approves by hand in the sheet; the bot notices once its cache expires.
-    worksheet.rows[1][1] = 1
+    worksheet.rows[1][3] = 1
     send("Almorcé sushi por 15.50 USD pagando con débito")
     assert expenses.saved == []  # still served from the in-memory snapshot (Sheets quota protection)
     assert gateway.sent_texts()[-1] == PENDING_REMINDER_MESSAGE
@@ -141,7 +159,7 @@ def test_full_lifecycle_unknown_user_onboarding_manual_approval_expense_and_reje
     assert "Gasto Registrado con Éxito" in gateway.sent_texts()[-1]
 
     # --- State 2: the administrator rejects the user.
-    worksheet.rows[1][1] = 2
+    worksheet.rows[1][3] = 2
     clock.advance(61)
     send("gasté 100 en café")
     assert gateway.sent_texts()[-1] == ACCESS_DENIED_MESSAGE
@@ -155,5 +173,58 @@ def test_a_stranger_messaging_repeatedly_causes_a_single_sheet_read(system):
     for _ in range(10):
         send("hola")
 
-    assert worksheet.reads == 1
+    # one read for the first lookup and one for the registration write; the rest is served from memory
+    assert worksheet.reads == 2
+    assert len(worksheet.rows) == 2 and len(worksheet.appends) == 1  # a single row, however much they insist
     assert len(gateway.sent_texts()) == 10
+
+
+def test_an_edit_reported_by_the_apps_script_takes_effect_immediately_without_waiting_for_the_cache(system):
+    send, gateway, worksheet, clock, groq, expenses = system
+    groq.onboarding_result = OnboardingLLMResponse(
+        collected=OnboardingData(full_name="Lucía Fernández", email="lucia@example.com")
+    )
+    send("soy Lucía Fernández, lucia@example.com")
+    assert gateway.sent_texts()[-1] == PENDING_APPROVAL_MESSAGE
+
+    worksheet.rows[1][3] = 1  # the administrator approves in the sheet...
+    assert send.sheets_event(event="estado_changed", sheet="usuarios", phone=PHONE) == {"status": "INVALIDATED"}
+    send("Almorcé sushi por 15.50 USD pagando con débito")  # ...and no 60 s wait is needed
+    assert len(expenses.saved) == 1
+
+    worksheet.rows[1][3] = 2  # a revocation is just as immediate
+    send.sheets_event(event="estado_changed", sheet="usuarios", phone=PHONE)
+    send("gasté 100 en café")
+    assert gateway.sent_texts()[-1] == ACCESS_DENIED_MESSAGE
+    assert len(expenses.saved) == 1
+
+
+def test_an_approved_user_gets_their_report_and_only_their_own_data(system):
+    send, gateway, worksheet, clock, groq, expenses = system
+    groq.onboarding_result = OnboardingLLMResponse(
+        collected=OnboardingData(full_name="Lucía Fernández", email="lucia@example.com")
+    )
+    send("soy Lucía Fernández, lucia@example.com")
+    worksheet.rows[1][3] = 1
+    send.sheets_event(phone=PHONE)
+    send("Almorcé sushi por 15.50 USD pagando con débito")
+    assert len(expenses.saved) == 1
+
+    # someone else's expense exists in the same sheet: it must never reach Lucía's report
+    from datetime import date
+    from src.domain.enums import InputTypeEnum
+    from src.domain.models import ExpenseRecord
+    expenses.saved.append(ExpenseRecord(
+        message_id="other", user_phone_hash="f" * 64, input_type=InputTypeEnum.TEXT, transaction_date=date(2026, 10, 19),
+        amount=777777, currency="ARS", category="Otros", subcategory="Otros", payment_method="Efectivo",
+        description="de otra persona", confidence_score=0.9, raw_text="x",
+    ))
+
+    send("Quiero mi resumen")
+
+    assert send.publisher.url in gateway.sent_texts()[-1]
+    title, rows, email = send.publisher.calls[0]
+    assert email == "lucia@example.com"
+    assert len(rows) == 1 and rows[0]["monto"] == 15.5
+    assert groq.expense_calls == ["Almorcé sushi por 15.50 USD pagando con débito"]  # the request never reached the LLM
+    assert len(expenses.saved) == 2  # nothing was registered for the request itself

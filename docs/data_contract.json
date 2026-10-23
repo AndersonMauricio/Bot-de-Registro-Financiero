@@ -44,8 +44,8 @@
         },
         "payment_method": {
           "type": "string",
-          "enum": ["CASH", "CREDIT_CARD", "DEBIT_CARD", "BANK_TRANSFER", "CRYPTO", "OTHER", "UNKNOWN"],
-          "description": "Canal o medio de pago normalizado"
+          "enum": ["Efectivo", "Tarjeta de Crédito", "Tarjeta de Débito", "Transferencia", "Billetera Virtual", "No Especificado"],
+          "description": "Medio de pago normalizado, en español y obligatorio ('No Especificado' si el usuario no lo menciona)"
         },
         "merchant_name": {
           "type": ["string", "null"],
@@ -54,21 +54,21 @@
         "category": {
           "type": "string",
           "enum": [
-            "ALIMENTACION",
-            "TRANSPORTE",
-            "VIVIENDA",
-            "SERVICIOS",
-            "SALUD",
-            "ENTRETENIMIENTO",
-            "EDUCACION",
-            "COMPRAS",
-            "OTROS"
+            "Alimentación",
+            "Transporte",
+            "Vivienda",
+            "Servicios",
+            "Salud",
+            "Entretenimiento",
+            "Educación",
+            "Compras",
+            "Otros"
           ],
-          "description": "Categoría macro estandarizada"
+          "description": "Categoría macro estandarizada, estrictamente en español"
         },
         "subcategory": {
           "type": "string",
-          "description": "Detalle granular (ej. 'Restaurante', 'Supermercado', 'Combustible')"
+          "description": "Detalle granular en español (ej. 'Restaurante', 'Supermercado', 'Combustible')"
         },
         "description": {
           "type": "string",

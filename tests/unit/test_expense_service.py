@@ -214,3 +214,67 @@ async def test_blocking_sdk_calls_do_not_freeze_the_event_loop(parts):
     task.cancel()
 
     assert ticks >= 15  # the loop kept running during the 300 ms blocking call (it would be ~0 otherwise)
+
+
+# ------------------------------------------------------- report requests are not expenses
+class FakeReportService:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def handle(self, phone: str) -> str:
+        self.calls.append(phone)
+        return "📊 reporte listo"
+
+
+@pytest.fixture
+def with_reports(parts):
+    service, groq, whisper, repo, whatsapp = parts
+    reports = FakeReportService()
+    service.report_service = reports
+    return service, groq, whisper, repo, whatsapp, reports
+
+
+async def test_a_text_report_request_is_answered_with_the_report_and_never_extracted_as_an_expense(with_reports):
+    service, groq, _, repo, whatsapp, reports = with_reports
+
+    result = await service.process_incoming_message(text_message("Quiero mi resumen"))
+
+    assert result is None
+    assert reports.calls == [PHONE]
+    assert whatsapp.texts == ["📊 reporte listo"]
+    assert groq.expense_calls == [] and repo.saved == []
+
+
+async def test_a_voice_note_asking_for_the_report_is_transcribed_and_answered_too(with_reports):
+    service, groq, whisper, repo, whatsapp, reports = with_reports
+    whisper.text = "Quiero mi resumen de gastos"
+
+    await service.process_incoming_message(audio_message())
+
+    assert whisper.calls and reports.calls == [PHONE]
+    assert groq.expense_calls == [] and repo.saved == []
+
+
+async def test_typing_covers_the_report_generation_and_ends_before_the_reply(with_reports):
+    service, _, _, _, whatsapp, _ = with_reports
+
+    await service.process_incoming_message(text_message("dame mi reporte"))
+
+    assert [e[0] for e in whatsapp.events] == ["typing_start", "typing_end", "send"]
+
+
+async def test_a_real_expense_that_mentions_a_summary_still_goes_through_extraction(with_reports):
+    service, groq, _, repo, _, reports = with_reports
+
+    await service.process_incoming_message(text_message("Pagué 4500 pesos el resumen de la tarjeta"))
+
+    assert reports.calls == []
+    assert len(groq.expense_calls) == 1 and len(repo.saved) == 1
+
+
+async def test_without_a_report_service_report_requests_behave_as_before(parts):
+    service, groq, _, _, _ = parts
+
+    await service.process_incoming_message(text_message("Quiero mi resumen"))
+
+    assert groq.expense_calls == ["Quiero mi resumen"]

@@ -8,11 +8,13 @@ from src.infrastructure.llm.groq_client import GroqLLMClient
 from src.infrastructure.storage.base import ExpenseRepositoryInterface, UserRepositoryInterface
 from src.infrastructure.storage.postgres_repo import PostgresExpenseRepository
 from src.infrastructure.storage.sheets_repo import GoogleSheetsExpenseRepository
+from src.infrastructure.storage.sheets_reports import GoogleSheetsReportPublisher
 from src.infrastructure.storage.sheets_users_repo import GoogleSheetsUserRepository
 from src.infrastructure.whatsapp.client import EvolutionAPIClient
 from src.services.expense_service import ExpenseProcessingService
 from src.services.message_router import MessageRouter
 from src.services.onboarding_service import OnboardingService
+from src.services.report_service import ReportService
 
 
 @lru_cache()
@@ -54,6 +56,16 @@ def get_user_repository() -> UserRepositoryInterface:
     return GoogleSheetsUserRepository()
 
 
+@lru_cache()
+def get_report_service() -> ReportService:
+    """Return the singleton ReportService (it keeps the per-user cooldown)."""
+    return ReportService(
+        expense_repository=get_expense_repository(),
+        user_repository=get_user_repository(),
+        publisher=GoogleSheetsReportPublisher(),
+    )
+
+
 def get_expense_service() -> ExpenseProcessingService:
     """Construct ExpenseProcessingService with injected dependencies."""
     return ExpenseProcessingService(
@@ -61,6 +73,7 @@ def get_expense_service() -> ExpenseProcessingService:
         groq_client=get_groq_client(),
         repository=get_expense_repository(),
         whatsapp_client=get_whatsapp_client(),
+        report_service=get_report_service(),
     )
 
 

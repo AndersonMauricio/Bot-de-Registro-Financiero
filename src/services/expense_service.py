@@ -14,6 +14,8 @@ from src.infrastructure.storage.base import ExpenseRepositoryInterface
 from src.infrastructure.whatsapp.client import EvolutionAPIClient, decode_base64_media
 from src.infrastructure.whatsapp.parser import ParsedWhatsAppMessage
 from src.services.data_quality import DataQualityGate
+from src.services.report_intent import is_report_request
+from src.services.report_service import ReportService
 
 
 class ExpenseProcessingService:
@@ -30,11 +32,13 @@ class ExpenseProcessingService:
         groq_client: GroqLLMClient,
         repository: ExpenseRepositoryInterface,
         whatsapp_client: EvolutionAPIClient,
+        report_service: Optional[ReportService] = None,
     ):
         self.whisper_client = whisper_client
         self.groq_client = groq_client
         self.repository = repository
         self.whatsapp_client = whatsapp_client
+        self.report_service = report_service
 
     async def process_incoming_message(
         self, parsed_msg: ParsedWhatsAppMessage
@@ -106,6 +110,11 @@ class ExpenseProcessingService:
                 "⚠️ No pudimos entender el mensaje. Por favor intenta nuevamente con un audio más claro o en texto.",
                 None,
             )
+
+        # 2b. Report requests ("quiero mi resumen") are answered with the user's own data, never extracted as expenses
+        if self.report_service and is_report_request(raw_text):
+            logger.info(f"Report requested by {mask_phone(parsed_msg.sender_phone)}.")
+            return await self.report_service.handle(parsed_msg.sender_phone), None
 
         # 3. Entity Extraction via LLM (Llama 3 on Groq)
         try:

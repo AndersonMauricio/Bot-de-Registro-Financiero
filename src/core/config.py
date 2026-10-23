@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     # How long the users table is served from memory before re-reading the sheet (Sheets read quota)
     USER_CACHE_TTL_SECONDS: int = Field(default=60, ge=1)
 
+    # Shared secret the Google Apps Script trigger sends in `x-webhook-secret` when the `estado` column is edited
+    SHEETS_WEBHOOK_SECRET: SecretStr = Field(default=SecretStr(""))
+
+    # Reports on demand: optional Drive folder (shared with the administrators) where report spreadsheets are
+    # created, and the minimum seconds between two reports for the same user
+    REPORTS_FOLDER_ID: str = Field(default="")
+    REPORT_COOLDOWN_SECONDS: int = Field(default=300, ge=0)
+
     @field_validator("USERS_WORKSHEET_NAME")
     @classmethod
     def clean_users_worksheet_name(cls, v: str) -> str:

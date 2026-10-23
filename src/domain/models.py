@@ -11,6 +11,20 @@ from src.domain.enums import CategoryEnum, InputTypeEnum, PaymentMethodEnum, Use
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# Columns of the `raw_expenses` worksheet, in order (Google Sheets MVP schema aligned with the future PostgreSQL design)
+EXPENSE_SHEET_HEADERS = [
+    "timestamp",
+    "message_id",
+    "user_phone_hash",
+    "fecha_gasto",
+    "monto",
+    "moneda",
+    "categoria",
+    "subcategoria",
+    "medio_de_pago",
+    "descripcion",
+]
+
 
 class ExtractionMetadata(BaseModel):
     """Metadata generated during LLM extraction process."""
@@ -40,8 +54,8 @@ class ExtractedTransaction(BaseModel):
     subcategory: str = Field(default="Otros", description="Granular subcategory")
     merchant_name: Optional[str] = Field(default=None, description="Merchant or vendor name")
     payment_method: PaymentMethodEnum = Field(
-        default=PaymentMethodEnum.UNKNOWN,
-        description="Normalized payment method",
+        ...,
+        description="Normalized payment method in Spanish (mandatory; 'No Especificado' when not mentioned)",
     )
     description: str = Field(..., min_length=1, description="Concise expense description")
 
@@ -81,12 +95,13 @@ class ExpenseRecord(BaseModel):
     raw_text: str
     ingested_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def to_sheets_row(self) -> list:
-        """Convert record to ordered list matching Google Sheets schema:
-        [timestamp, fecha_gasto, monto, moneda, categoria, descripcion]
+    def to_sheets_dict(self) -> dict:
+        """Values keyed by the `raw_expenses` column names (see EXPENSE_SHEET_HEADERS).
 
-        - timestamp   : fecha y hora de ingesta del registro (UTC-3 Argentina)
-        - fecha_gasto : fecha real del gasto resuelto por el LLM (ej. 'ayer' → yesterday)
+        - timestamp       : fecha y hora de ingesta del registro, en la zona horaria configurada
+        - message_id      : ID del mensaje de Evolution API (llave de idempotencia)
+        - user_phone_hash : SHA-256 del número del remitente (el número nunca se escribe en claro)
+        - fecha_gasto     : fecha real del gasto resuelta por el LLM (ej. 'ayer' → yesterday)
         """
         try:
             local_tz = ZoneInfo(settings.TIMEZONE)
@@ -95,16 +110,23 @@ class ExpenseRecord(BaseModel):
             local_tz = timezone(timedelta(hours=-3))
             local_dt = self.ingested_at_utc.astimezone(local_tz)
 
-        timestamp_formatted = local_dt.strftime("%Y-%m-%d %H:%M:%S")
-        fecha_gasto = self.transaction_date.isoformat()  # YYYY-MM-DD
-        return [
-            timestamp_formatted,  # timestamp de ingesta (UTC-3)
-            fecha_gasto,           # fecha_gasto (fecha real del gasto)
-            self.amount,           # monto
-            self.currency,         # moneda
-            self.category,         # categoria
-            self.description,      # descripcion
-        ]
+        return {
+            "timestamp": local_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "message_id": self.message_id,
+            "user_phone_hash": self.user_phone_hash,
+            "fecha_gasto": self.transaction_date.isoformat(),  # YYYY-MM-DD
+            "monto": self.amount,
+            "moneda": self.currency,
+            "categoria": self.category,
+            "subcategoria": self.subcategory,
+            "medio_de_pago": self.payment_method,
+            "descripcion": self.description,
+        }
+
+    def to_sheets_row(self) -> list:
+        """Values as an ordered list matching EXPENSE_SHEET_HEADERS."""
+        values = self.to_sheets_dict()
+        return [values[header] for header in EXPENSE_SHEET_HEADERS]
 
 
 class DataQualityResult(BaseModel):

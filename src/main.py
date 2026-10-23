@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.v1.health import router as health_router
-from src.api.v1.webhooks import router as webhooks_router
+from src.api.v1.webhooks import router as webhooks_router, sheets_router
 from src.core.config import settings
 from src.core.logging import logger
 
@@ -18,6 +18,11 @@ async def lifespan(app: FastAPI):
         logger.warning("Evolution API is not configured (EVOLUTION_API_KEY / EVOLUTION_INSTANCE): replies are disabled.")
     if not settings.EVOLUTION_WEBHOOK_SECRET.get_secret_value():
         logger.warning("EVOLUTION_WEBHOOK_SECRET is not set: every webhook call will be rejected.")
+    if not settings.SHEETS_WEBHOOK_SECRET.get_secret_value():
+        logger.info(
+            f"SHEETS_WEBHOOK_SECRET is not set: edits to the users tab apply after the cache expires "
+            f"({settings.USER_CACHE_TTL_SECONDS} s) instead of immediately."
+        )
     yield
     logger.info("Shutting down application cleanly.")
 
@@ -52,6 +57,7 @@ async def root():
             "docs": "/docs",
             "health": "/api/v1/health",
             "evolution_webhook": "/api/v1/webhooks/evolution",
+            "sheets_webhook": "/api/v1/webhooks/sheets",
         },
     }
 
@@ -59,6 +65,7 @@ async def root():
 # Include v1 API Routers
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(webhooks_router, prefix="/api/v1")
+app.include_router(sheets_router, prefix="/api/v1")
 
 
 if __name__ == "__main__":

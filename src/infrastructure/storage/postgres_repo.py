@@ -87,3 +87,30 @@ class PostgresExpenseRepository(ExpenseRepositoryInterface):
         except Exception as e:
             logger.error(f"Failed to persist expense in PostgreSQL: {e}")
             raise StorageError(f"PostgreSQL insert failed: {e}") from e
+
+    def get_expenses_by_user(self, user_phone_hash: str) -> list[dict]:
+        """Rows of one user (strict match on user_phone_hash), oldest first."""
+        if not user_phone_hash:
+            return []
+        try:
+            with self.engine.connect() as conn:
+                query = (
+                    select(expenses_table)
+                    .where(expenses_table.c.user_phone_hash == user_phone_hash)
+                    .order_by(expenses_table.c.transaction_date, expenses_table.c.transaction_time)
+                )
+                return [
+                    {
+                        "fecha_gasto": row.transaction_date.isoformat(),
+                        "monto": row.amount,
+                        "moneda": row.currency,
+                        "categoria": row.category,
+                        "subcategoria": row.subcategory or "",
+                        "medio_de_pago": row.payment_method,
+                        "descripcion": row.description,
+                    }
+                    for row in conn.execute(query)
+                ]
+        except Exception as e:
+            logger.error(f"Failed to read expenses from PostgreSQL: {e}")
+            raise StorageError(f"PostgreSQL read failed: {e}") from e

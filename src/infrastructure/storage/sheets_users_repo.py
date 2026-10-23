@@ -18,8 +18,12 @@ from src.infrastructure.cache.ttl_cache import TTLCache
 from src.infrastructure.storage.base import UserRepositoryInterface
 from src.infrastructure.storage.sheets_client import get_gspread_client
 
-HEADERS = ["telefono", "estado", "nombre_completo", "email", "fecha_alta", "fecha_actualizacion"]
+# Header row written when the tab is empty (matching is case-insensitive, so the sheet may use any capitalization)
+HEADERS = ["Telefono", "Nombre", "Email", "Estado", "Fecha_Registro"]
+COLUMN_KEYS = [h.lower() for h in HEADERS]
 REQUIRED_HEADERS = ("telefono", "estado")
+# Names used by the first version of the tab keep working
+LEGACY_ALIASES = {"nombre_completo": "nombre", "fecha_alta": "fecha_registro"}
 
 _SNAPSHOT_KEY = "users"
 # If a refresh fails, keep serving the last known users for up to this long (then fail closed)
@@ -82,24 +86,40 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
         self._cache: TTLCache = cache or TTLCache(settings.USER_CACHE_TTL_SECONDS, clock=clock)
         self._lock = threading.Lock()
         self._retry_not_before = 0.0
+        # Phone keys whose row was reported as edited (Apps Script webhook): never answered from memory
+        self._dirty: set[str] = set()
 
     # ------------------------------------------------------------------ reads
     def get_user(self, phone: str) -> Optional[UserRecord]:
-        return self._load_users().get(phone_key(phone))
+        key = phone_key(phone)
+        return self._load_users(force=key in self._dirty).get(key)
 
-    def _load_users(self) -> dict[str, UserRecord]:
-        """Return the cached users table, refreshing it from the sheet when it expired."""
+    def invalidate(self, phone: str) -> None:
+        """The sheet changed for this phone: its next lookup re-reads the sheet instead of using the cache."""
+        key = phone_key(phone)
+        if key:
+            self._dirty.add(key)
+
+    def invalidate_all(self) -> None:
+        """Drop the whole cached table (and any stale copy): the next lookup re-reads the sheet."""
+        self._cache.delete(_SNAPSHOT_KEY)
+        self._retry_not_before = 0.0
+
+    def _load_users(self, force: bool = False) -> dict[str, UserRecord]:
+        """Return the cached users table, refreshing it from the sheet when it expired (or `force`)."""
         with self._lock:  # single-flight: concurrent misses trigger one read
-            users = self._cache.get(_SNAPSHOT_KEY)
-            if users is not None:
-                return users
+            if not force:
+                users = self._cache.get(_SNAPSHOT_KEY)
+                if users is not None:
+                    return users
 
-            stale = self._cache.get(_SNAPSHOT_KEY, max_stale=STALE_GRACE_SECONDS)
-            if self._clock() < self._retry_not_before:
+            stale = None if force else self._cache.get(_SNAPSHOT_KEY, max_stale=STALE_GRACE_SECONDS)
+            if not force and self._clock() < self._retry_not_before:
                 if stale is not None:
                     return stale
                 raise StorageError("Users sheet temporarily unavailable; retrying shortly.")
 
+            pending = set(self._dirty)  # invalidations that arrive while reading stay pending
             try:
                 table = self._read_table()
             except StorageError as e:
@@ -107,9 +127,10 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
                 if stale is not None:
                     logger.warning(f"Users sheet refresh failed ({e}); serving last known users.")
                     return stale
-                raise
+                raise  # forced reads fail closed: an edited record is never answered with its old state
 
             self._retry_not_before = 0.0
+            self._dirty -= pending
             users = {key: record for key, (_, record) in table.rows.items()}
             self._cache.set(_SNAPSHOT_KEY, users)
             logger.info(f"Users sheet refreshed: {len(users)} registered users cached.")
@@ -152,6 +173,9 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
 
     def _parse_table(self, values: list[list]) -> _Table:
         columns = {str(h).strip().lower(): i for i, h in enumerate(values[0]) if str(h).strip()}
+        for legacy, current in LEGACY_ALIASES.items():
+            if legacy in columns and current not in columns:
+                columns[current] = columns[legacy]
         missing = [h for h in REQUIRED_HEADERS if h not in columns]
         if missing:
             raise StorageError(
@@ -167,7 +191,7 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
             record = UserRecord(
                 phone=normalize_phone(phone_raw),
                 status=parse_status(self._cell(row, columns, "estado")),
-                full_name=str(self._cell(row, columns, "nombre_completo")).strip() or None,
+                full_name=str(self._cell(row, columns, "nombre")).strip() or None,
                 email=str(self._cell(row, columns, "email")).strip() or None,
             )
             if key in rows:
@@ -184,11 +208,12 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
         with self._lock:
             ws = self._get_worksheet()
             # Fresh read: cached row numbers could be stale if someone sorted or edited the sheet.
+            pending = set(self._dirty)
             table = self._read_table()
             now = _local_timestamp()
             existing = table.rows.get(key)
 
-            absent = [h for h in HEADERS if h not in table.columns]
+            absent = [k for k in COLUMN_KEYS if k not in table.columns]
             if absent:
                 logger.warning(f"Users sheet has no {absent} column(s); those values will not be stored.")
 
@@ -204,10 +229,9 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
                         self._build_row(table.columns, {
                             "telefono": record.phone,
                             "estado": "",
-                            "nombre_completo": record.full_name or "",
+                            "nombre": record.full_name or "",
                             "email": record.email or "",
-                            "fecha_alta": now,
-                            "fecha_actualizacion": now,
+                            "fecha_registro": now,  # set by the backend when it first sees the number
                         }),
                         value_input_option=ValueInputOption.raw,  # RAW: user text is never parsed as a formula
                     )
@@ -217,15 +241,12 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
                         "full_name": data.full_name or current.full_name,
                         "email": data.email or current.email,
                     })
-                    cells = {
-                        "nombre_completo": record.full_name,
-                        "email": record.email,
-                        "fecha_actualizacion": now,
-                    }
+                    # Only what changed: re-registering a known number must not cost a write
+                    cells = {"nombre": (record.full_name, current.full_name), "email": (record.email, current.email)}
                     updates = [
-                        {"range": rowcol_to_a1(row_number, table.columns[name] + 1), "values": [[value]]}
-                        for name, value in cells.items()
-                        if value and name in table.columns
+                        {"range": rowcol_to_a1(row_number, table.columns[name] + 1), "values": [[new_value]]}
+                        for name, (new_value, old_value) in cells.items()
+                        if new_value and new_value != old_value and name in table.columns
                     ]
                     if updates:
                         ws.batch_update(updates, raw=True)
@@ -237,6 +258,7 @@ class GoogleSheetsUserRepository(UserRepositoryInterface):
             users = {k: r for k, (_, r) in table.rows.items()}
             users[key] = record
             self._cache.set(_SNAPSHOT_KEY, users)
+            self._dirty -= pending
             logger.info(f"Onboarding data saved for {mask_phone(phone)}.")
             return record
 
