@@ -194,24 +194,34 @@ class FakeExpenseRepository(ExpenseRepositoryInterface):
             if r.user_phone_hash == user_phone_hash
         ]
 
-    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
+    def find_expenses_by_message_id(self, message_id: str, user_phone_hash: str) -> list[dict]:
         self.lookups.append((message_id, user_phone_hash))
+        found = []
         for record in self.saved:
             if record.user_phone_hash != user_phone_hash:
                 continue
             if record.message_id == message_id or self.reply_ids.get(record.message_id) == message_id:
-                return {
-                    "fecha_gasto": record.transaction_date.isoformat(),
-                    "monto": record.amount,
-                    "moneda": record.currency,
-                    "categoria": record.category,
-                    "subcategoria": record.subcategory,
-                    "medio_de_pago": record.payment_method,
-                    "descripcion": record.description,
-                    "message_id": record.message_id,
-                    "reply_message_id": self.reply_ids.get(record.message_id, ""),
-                }
-        return None
+                found.append(
+                    {
+                        "fecha_gasto": record.transaction_date.isoformat(),
+                        "monto": record.amount,
+                        "moneda": record.currency,
+                        "categoria": record.category,
+                        "subcategoria": record.subcategory,
+                        "medio_de_pago": record.payment_method,
+                        "descripcion": record.description,
+                        "message_id": record.message_id,
+                        "reply_message_id": self.reply_ids.get(record.message_id, ""),
+                    }
+                )
+        return found
+
+    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
+        matches = self.find_expenses_by_message_id(message_id, user_phone_hash)
+        return matches[0] if matches else None
+
+    def save_expenses(self, records: list) -> list[str]:
+        return [self.save_expense(record) for record in records]
 
     def update_expense(self, record) -> bool:
         if self.fail_update:
@@ -240,6 +250,7 @@ class FakeWorksheet:
         self.rows = [list(r) for r in rows]
         self.reads = 0
         self.appends: list[tuple[list, object]] = []  # (values as sent, value_input_option)
+        self.append_rows_calls: list[tuple[int, object]] = []  # (row count, value_input_option)
         self.batch_updates: list[list[dict]] = []
         self.read_error: Optional[Exception] = None
 
@@ -271,6 +282,12 @@ class FakeWorksheet:
         if str(value_input_option).endswith("USER_ENTERED") or value_input_option == "USER_ENTERED":
             stored = [v[1:] if isinstance(v, str) and v.startswith("'") else v for v in stored]
         self.rows.append(stored)
+
+    def append_rows(self, values, value_input_option=None, **kwargs) -> None:
+        """gspread appends a whole batch of rows with a single request."""
+        self.append_rows_calls.append((len(values), value_input_option))
+        for row in values:
+            self.append_row(row, value_input_option=value_input_option)
 
     def batch_update(self, data, raw: bool = True, **kwargs) -> None:
         self.batch_updates.append(data)

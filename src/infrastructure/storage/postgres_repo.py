@@ -50,44 +50,53 @@ class PostgresExpenseRepository(ExpenseRepositoryInterface):
             raise StorageError(f"PostgreSQL connection initialization failed: {e}") from e
 
     def is_message_processed(self, message_id: str) -> bool:
-        """Check if message_id exists in raw_whatsapp.expenses."""
+        """Check if message_id exists in raw_whatsapp.expenses (or any of its batch rows `<id>-<n>`)."""
+        escaped = message_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         try:
             with self.engine.connect() as conn:
                 query = select(expenses_table.c.transaction_id).where(
-                    expenses_table.c.message_id == message_id
+                    or_(
+                        expenses_table.c.message_id == message_id,
+                        expenses_table.c.message_id.like(f"{escaped}-%", escape="\\"),
+                    )
                 )
-                result = conn.execute(query).scalar_one_or_none()
-                return result is not None
+                return conn.execute(query).first() is not None
         except Exception as e:
             logger.error(f"Error querying message_id in PostgreSQL: {e}")
             return False
 
-    def save_expense(self, record: ExpenseRecord) -> str:
-        """Insert expense record into PostgreSQL."""
+    @staticmethod
+    def _values(record: ExpenseRecord) -> dict:
+        """Row values for one expense."""
+        return {
+            "transaction_id": record.transaction_id,
+            "message_id": record.message_id,
+            "user_phone_hash": record.user_phone_hash,
+            "input_type": record.input_type.value,
+            "transaction_date": record.transaction_date,
+            "transaction_time": record.transaction_time,
+            "amount": record.amount,
+            "currency": record.currency,
+            "category": record.category,
+            "subcategory": record.subcategory,
+            "merchant_name": record.merchant_name,
+            "payment_method": record.payment_method,
+            "description": record.description,
+            "confidence_score": record.confidence_score,
+            "raw_text": record.raw_text,
+        }
+
+    def save_expenses(self, records: list[ExpenseRecord]) -> list[str]:
+        """Insert every record in one transaction: either all rows land or none do."""
+        if not records:
+            return []
         try:
             with self.engine.begin() as conn:
-                stmt = expenses_table.insert().values(
-                    transaction_id=record.transaction_id,
-                    message_id=record.message_id,
-                    user_phone_hash=record.user_phone_hash,
-                    input_type=record.input_type.value,
-                    transaction_date=record.transaction_date,
-                    transaction_time=record.transaction_time,
-                    amount=record.amount,
-                    currency=record.currency,
-                    category=record.category,
-                    subcategory=record.subcategory,
-                    merchant_name=record.merchant_name,
-                    payment_method=record.payment_method,
-                    description=record.description,
-                    confidence_score=record.confidence_score,
-                    raw_text=record.raw_text,
-                )
-                conn.execute(stmt)
-            logger.info(f"Expense {record.transaction_id} saved in PostgreSQL.")
-            return str(record.transaction_id)
+                conn.execute(expenses_table.insert(), [self._values(record) for record in records])
+            logger.info(f"{len(records)} expense(s) saved in PostgreSQL.")
+            return [str(record.transaction_id) for record in records]
         except Exception as e:
-            logger.error(f"Failed to persist expense in PostgreSQL: {e}")
+            logger.error(f"Failed to persist expenses in PostgreSQL: {e}")
             raise StorageError(f"PostgreSQL insert failed: {e}") from e
 
     def get_expenses_by_user(self, user_phone_hash: str) -> list[dict]:
@@ -124,24 +133,32 @@ class PostgresExpenseRepository(ExpenseRepositoryInterface):
             "reply_message_id": row.reply_message_id or "",
         }
 
-    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
-        """This user's own expense cited by `message_id`, or None when it does not exist or is not theirs."""
+    def find_expenses_by_message_id(self, message_id: str, user_phone_hash: str) -> list[dict]:
+        """All of this user's expenses cited by `message_id` (a batch shares the confirmation id)."""
         if not (message_id and user_phone_hash):
-            return None
+            return []
         try:
             with self.engine.connect() as conn:
-                query = select(expenses_table).where(
-                    or_(
-                        expenses_table.c.message_id == message_id,
-                        expenses_table.c.reply_message_id == message_id,
-                    ),
-                    expenses_table.c.user_phone_hash == user_phone_hash,
+                query = (
+                    select(expenses_table)
+                    .where(
+                        or_(
+                            expenses_table.c.message_id == message_id,
+                            expenses_table.c.reply_message_id == message_id,
+                        ),
+                        expenses_table.c.user_phone_hash == user_phone_hash,
+                    )
+                    .order_by(expenses_table.c.message_id)
                 )
-                row = conn.execute(query).first()
-                return self._row_to_dict(row) if row else None
+                return [self._row_to_dict(row) for row in conn.execute(query)]
         except Exception as e:
             logger.error(f"Failed to find an expense by message id in PostgreSQL: {e}")
             raise StorageError(f"PostgreSQL read failed: {e}") from e
+
+    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
+        """First of this user's own expenses cited by `message_id`."""
+        matches = self.find_expenses_by_message_id(message_id, user_phone_hash)
+        return matches[0] if matches else None
 
     def update_expense(self, record: ExpenseRecord) -> bool:
         """Overwrite the data columns of the row of `record.message_id`, only if it belongs to that user."""

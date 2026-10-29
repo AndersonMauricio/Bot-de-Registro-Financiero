@@ -10,10 +10,15 @@ from datetime import date
 
 EXTRACTION_SYSTEM_PROMPT = """Eres un asistente financiero experto en procesamiento y extracción estructurada de transacciones y gastos a partir de textos, transcripciones de notas de voz y recibos.
 
-Tu tarea es extraer los datos clave del gasto y devolver ÚNICAMENTE un objeto JSON estrictamente compatible con el esquema requerido.
+Tu tarea es extraer los datos clave de CADA gasto mencionado y devolver ÚNICAMENTE un objeto JSON estrictamente compatible con el esquema requerido.
 
-REGLAS DE EXTRACCIÓN:
-1. "confidence_score": Asigna un valor flotante entre 0.0 y 1.0 indicando tu grado de seguridad en la extracción. Si falta el monto o el concepto es ininteligible, asigna menos de 0.60.
+REGLA PRINCIPAL SOBRE VARIOS GASTOS:
+- El mensaje puede describir UNO o VARIOS gastos. Devuelve siempre la lista "transactions" con un elemento por cada gasto mencionado, en el orden en que aparecen.
+- Cada elemento lleva sus propios datos: usa el monto, la fecha y el medio de pago que correspondan a ESE gasto. Si un dato aparece una sola vez y aplica a todos ("pagué 20.000 y 5.000 con débito"), úsalo en cada uno.
+- NUNCA sumes los gastos en un solo monto, ni repitas un mismo gasto, ni inventes gastos que el mensaje no menciona. Si hay un solo gasto, la lista tiene un único elemento.
+
+REGLAS DE EXTRACCIÓN (aplican a cada elemento de "transactions"):
+1. "confidence_score": Va en "metadata" y es un valor flotante entre 0.0 y 1.0 con tu grado de seguridad en TODA la extracción. Si falta el monto o el concepto es ininteligible, asigna menos de 0.60.
 2. "transaction_date": Resuelve fechas relativas a partir de la fecha de referencia del mensaje:
    - "ayer" → fecha de referencia menos 1 día
    - "antier" / "antes de ayer" → fecha de referencia menos 2 días
@@ -51,17 +56,19 @@ FORMATO OBLIGATORIO DE RESPUESTA JSON:
     "raw_text": "texto original",
     "extraction_notes": "opcional, notas o aclaraciones"
   },
-  "transaction": {
-    "transaction_date": "YYYY-MM-DD",
-    "transaction_time": "HH:mm:ss o null",
-    "amount": 1250.50,
-    "currency": "USD",
-    "category": "Alimentación",
-    "subcategory": "Restaurante",
-    "merchant_name": "Nombre o null",
-    "payment_method": "Tarjeta de Crédito",
-    "description": "Almuerzo de trabajo"
-  }
+  "transactions": [
+    {
+      "transaction_date": "YYYY-MM-DD",
+      "transaction_time": "HH:mm:ss o null",
+      "amount": 1250.50,
+      "currency": "USD",
+      "category": "Alimentación",
+      "subcategory": "Restaurante",
+      "merchant_name": "Nombre o null",
+      "payment_method": "Tarjeta de Crédito",
+      "description": "Almuerzo de trabajo"
+    }
+  ]
 }
 """
 
@@ -78,17 +85,19 @@ FEW_SHOT_EXAMPLES = [
     "raw_text": "Ayer pagué 3500 pesos en la farmacia San Pablo con tarjeta de débito para unos remedios",
     "extraction_notes": null
   },
-  "transaction": {
-    "transaction_date": "2026-10-18",
-    "transaction_time": null,
-    "amount": 3500.00,
-    "currency": "ARS",
-    "category": "Salud",
-    "subcategory": "Farmacia",
-    "merchant_name": "Farmacia San Pablo",
-    "payment_method": "Tarjeta de Débito",
-    "description": "Medicamentos y remedios"
-  }
+  "transactions": [
+    {
+      "transaction_date": "2026-10-18",
+      "transaction_time": null,
+      "amount": 3500.00,
+      "currency": "ARS",
+      "category": "Salud",
+      "subcategory": "Farmacia",
+      "merchant_name": "Farmacia San Pablo",
+      "payment_method": "Tarjeta de Débito",
+      "description": "Medicamentos y remedios"
+    }
+  ]
 }"""
     },
     {
@@ -103,17 +112,57 @@ FEW_SHOT_EXAMPLES = [
     "raw_text": "Gasté 12000 en el supermercado",
     "extraction_notes": "No se mencionó el medio de pago"
   },
-  "transaction": {
-    "transaction_date": "2026-10-19",
-    "transaction_time": null,
-    "amount": 12000.00,
-    "currency": "ARS",
-    "category": "Alimentación",
-    "subcategory": "Supermercado",
-    "merchant_name": null,
-    "payment_method": "No Especificado",
-    "description": "Compras en el supermercado"
-  }
+  "transactions": [
+    {
+      "transaction_date": "2026-10-19",
+      "transaction_time": null,
+      "amount": 12000.00,
+      "currency": "ARS",
+      "category": "Alimentación",
+      "subcategory": "Supermercado",
+      "merchant_name": null,
+      "payment_method": "No Especificado",
+      "description": "Compras en el supermercado"
+    }
+  ]
+}"""
+    },
+    {
+        "role": "user",
+        "content": "Fecha referencia: 2026-10-28. Mensaje: 'Anotá 20.000 de pochoclos y, a la salida, pagué 5.000 de estacionamiento con débito'"
+    },
+    {
+        "role": "assistant",
+        "content": """{
+  "metadata": {
+    "confidence_score": 0.96,
+    "raw_text": "Anotá 20.000 de pochoclos y, a la salida, pagué 5.000 de estacionamiento con débito",
+    "extraction_notes": "Dos gastos en un mismo mensaje; el medio de pago se menciona una sola vez y aplica a ambos"
+  },
+  "transactions": [
+    {
+      "transaction_date": "2026-10-28",
+      "transaction_time": null,
+      "amount": 20000.00,
+      "currency": "ARS",
+      "category": "Entretenimiento",
+      "subcategory": "Cine",
+      "merchant_name": null,
+      "payment_method": "Tarjeta de Débito",
+      "description": "Pochoclos"
+    },
+    {
+      "transaction_date": "2026-10-28",
+      "transaction_time": null,
+      "amount": 5000.00,
+      "currency": "ARS",
+      "category": "Transporte",
+      "subcategory": "Estacionamiento",
+      "merchant_name": null,
+      "payment_method": "Tarjeta de Débito",
+      "description": "Estacionamiento"
+    }
+  ]
 }"""
     }
 ]

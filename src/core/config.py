@@ -28,6 +28,16 @@ class Settings(BaseSettings):
     GROQ_API_KEY: SecretStr = Field(default=SecretStr(""))
     GROQ_LLM_MODEL: str = Field(default="openai/gpt-oss-20b")
     GROQ_WHISPER_MODEL: str = Field(default="whisper-large-v3")
+    # The SDK defaults to a 10-minute timeout: a hung provider would leave the user without an answer
+    GROQ_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0)
+    GROQ_MAX_RETRIES: int = Field(default=2, ge=0)
+    # Hard cap for a blocking storage call, and for the HTTP calls to the WhatsApp gateway
+    STORAGE_TIMEOUT_SECONDS: float = Field(default=20.0, gt=0)
+    HTTP_TIMEOUT_SECONDS: float = Field(default=15.0, gt=0)
+    # One message may describe several expenses; beyond this the bot asks to split it
+    MAX_TRANSACTIONS_PER_MESSAGE: int = Field(default=10, ge=1)
+    # How long the numbered options of a batch stay valid for a follow-up correction
+    PENDING_SELECTION_TTL_SECONDS: int = Field(default=600, ge=1)
 
     # Evolution API (WhatsApp gateway)
     EVOLUTION_API_URL: str = Field(default="http://localhost:8080")

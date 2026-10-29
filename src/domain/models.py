@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from src.core.config import settings
 from src.domain.enums import CategoryEnum, InputTypeEnum, PaymentMethodEnum, UserStatusEnum
 
@@ -61,14 +61,18 @@ class ExtractionMetadata(BaseModel):
 
 
 class ExtractedTransaction(BaseModel):
-    """Financial transaction entity returned by LLM extraction."""
+    """Financial transaction entity returned by LLM extraction.
+
+    The hard business rules (positive amount, ISO currency, non-empty detail) live in the Data Quality
+    Gate, not here: with several expenses per message, one bad item must not discard the whole batch.
+    """
     transaction_date: date = Field(..., description="Purchase date in ISO 8601 (YYYY-MM-DD)")
     transaction_time: Optional[time] = Field(
         default=None,
         description="Transaction time (HH:mm:ss) or None",
     )
-    amount: float = Field(..., gt=0, description="Total amount with up to 2 decimal places")
-    currency: str = Field(..., min_length=3, max_length=3, description="ISO 4217 currency code")
+    amount: float = Field(..., description="Total amount with up to 2 decimal places (validated by the gate)")
+    currency: str = Field(..., description="ISO 4217 currency code (validated by the gate)")
     category: CategoryEnum = Field(default=CategoryEnum.OTROS, description="Macro category")
     subcategory: str = Field(default="Otros", description="Granular subcategory")
     merchant_name: Optional[str] = Field(default=None, description="Merchant or vendor name")
@@ -76,7 +80,7 @@ class ExtractedTransaction(BaseModel):
         ...,
         description="Normalized payment method in Spanish (mandatory; 'No Especificado' when not mentioned)",
     )
-    description: str = Field(..., min_length=1, description="Concise expense description")
+    description: str = Field(default="", description="Concise expense description (validated by the gate)")
 
     @field_validator("currency")
     @classmethod
@@ -90,9 +94,36 @@ class ExtractedTransaction(BaseModel):
 
 
 class LLMExtractionResponse(BaseModel):
-    """Top-level contract expected from the LLM."""
+    """Top-level contract expected from the LLM.
+
+    One message may describe several expenses, so the contract carries a list. The legacy single
+    `transaction` key is still accepted (the correction branch and older prompts use it) and the two
+    views are kept in sync, so callers can keep reading `response.transaction` for a single expense.
+    """
     metadata: ExtractionMetadata
-    transaction: ExtractedTransaction
+    transactions: list[ExtractedTransaction] = Field(
+        default_factory=list,
+        description="One entry per expense described in the message (at least one)",
+    )
+    transaction: Optional[ExtractedTransaction] = Field(
+        default=None,
+        description="Deprecated single-transaction view; mirrored from `transactions` when there is only one",
+    )
+
+    @model_validator(mode="after")
+    def sync_single_and_multi_views(self) -> "LLMExtractionResponse":
+        if not self.transactions and self.transaction is not None:
+            self.transactions = [self.transaction]
+        if not self.transactions:
+            raise ValueError("the response must contain at least one transaction")
+        if self.transaction is None and len(self.transactions) == 1:
+            self.transaction = self.transactions[0]
+        return self
+
+    @property
+    def is_batch(self) -> bool:
+        """True when the message described more than one expense."""
+        return len(self.transactions) > 1
 
 
 class ExpenseRecord(BaseModel):

@@ -24,6 +24,25 @@
       "required": ["confidence_score", "raw_text"],
       "additionalProperties": false
     },
+    "transactions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "description": "Un elemento por cada gasto mencionado en el mensaje, en el orden en que aparecen",
+      "items": { "$ref": "#/definitions/transaction" }
+    },
+    "transaction": {
+      "$ref": "#/definitions/transaction",
+      "description": "DEPRECADO: vista de un solo gasto. Se acepta por compatibilidad; usá `transactions`"
+    }
+  },
+  "anyOf": [
+    { "required": ["transactions"] },
+    { "required": ["transaction"] }
+  ],
+  "required": ["metadata"],
+  "additionalProperties": false,
+  "definitions": {
     "transaction": {
       "type": "object",
       "properties": {
@@ -91,7 +110,5 @@
       ],
       "additionalProperties": false
     }
-  },
-  "required": ["metadata", "transaction"],
-  "additionalProperties": false
+  }
 }

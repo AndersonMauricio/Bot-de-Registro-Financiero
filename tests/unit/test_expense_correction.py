@@ -188,7 +188,7 @@ async def test_a_lookup_failure_is_reported_without_touching_the_row(parts, monk
     def boom(*args, **kwargs):
         raise RuntimeError("sheets down")
 
-    monkeypatch.setattr(repo, "find_expense_by_message_id", boom)
+    monkeypatch.setattr(repo, "find_expenses_by_message_id", boom)
 
     await service.process_incoming_message(correction_message())
 

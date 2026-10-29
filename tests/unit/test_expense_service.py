@@ -183,7 +183,8 @@ async def test_llm_failure_is_reported(parts):
 
     assert await service.process_incoming_message(text_message()) is None
 
-    assert "error analizando los datos" in whatsapp.texts[0]
+    assert "error en el servidor de inteligencia artificial" in whatsapp.texts[0]
+    assert "no fue guardado" in whatsapp.texts[0]
     assert repo.saved == []
 
 
@@ -193,7 +194,7 @@ async def test_persistence_failure_is_reported(parts):
 
     await service.process_incoming_message(text_message())
 
-    assert "inconveniente al guardar" in whatsapp.texts[0]
+    assert "No se guardó nada" in whatsapp.texts[0]
     assert "Gasto Registrado" not in whatsapp.texts[0]
 
 

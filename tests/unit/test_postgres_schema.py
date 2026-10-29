@@ -15,7 +15,8 @@ def test_the_expenses_table_can_remember_the_bot_confirmation():
 
 def test_the_edit_operations_are_part_of_the_repository_contract():
     assert {
-        "find_expense_by_message_id",
+        "save_expenses",
+        "find_expenses_by_message_id",
         "update_expense",
         "set_reply_message_id",
     } <= ExpenseRepositoryInterface.__abstractmethods__

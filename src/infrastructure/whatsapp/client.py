@@ -48,6 +48,11 @@ class EvolutionAPIClient:
         self._transport = transport
 
     @property
+    def media_timeout(self) -> float:
+        """Audio and images are much larger than text payloads: give them twice the HTTP budget."""
+        return settings.HTTP_TIMEOUT_SECONDS * 2
+
+    @property
     def is_configured(self) -> bool:
         return bool(self.base_url and self.api_key and self.instance)
 
@@ -115,7 +120,7 @@ class EvolutionAPIClient:
         return delivered, message_id
 
     async def _post_text(self, payload: dict, recipient_phone: str) -> tuple[bool, Optional[str]]:
-        async with self._http(timeout=15.0) as client:
+        async with self._http(timeout=settings.HTTP_TIMEOUT_SECONDS) as client:
             try:
                 response = await client.post(self._url("message/sendText"), headers=self.headers, json=payload)
                 response.raise_for_status()
@@ -204,7 +209,7 @@ class EvolutionAPIClient:
 
         payload = {"message": {"key": {"id": message_id}}, "convertToMp4": False}
 
-        async with self._http(timeout=30.0) as client:
+        async with self._http(timeout=self.media_timeout) as client:
             try:
                 response = await client.post(
                     self._url("chat/getBase64FromMediaMessage"), headers=self.headers, json=payload
@@ -245,7 +250,7 @@ class EvolutionAPIClient:
             }
         }
 
-        async with self._http(timeout=15.0) as client:
+        async with self._http(timeout=settings.HTTP_TIMEOUT_SECONDS) as client:
             try:
                 response = await client.post(self._url("webhook/set"), headers=self.headers, json=payload)
                 response.raise_for_status()

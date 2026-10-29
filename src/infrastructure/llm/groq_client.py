@@ -28,7 +28,12 @@ class GroqLLMClient:
         key = api_key or settings.GROQ_API_KEY.get_secret_value()
         if not key:
             logger.warning("GROQ_API_KEY is not configured.")
-        self.client = Groq(api_key=key) if key else None
+        # The SDK defaults to a 10-minute timeout; an explicit budget keeps the chat responsive
+        self.client = (
+            Groq(api_key=key, timeout=settings.GROQ_TIMEOUT_SECONDS, max_retries=settings.GROQ_MAX_RETRIES)
+            if key
+            else None
+        )
 
     def _get_candidate_models(self) -> list[str]:
         """Discover available chat models dynamically from Groq account with fallbacks."""

@@ -32,3 +32,8 @@ class StorageError(BotWppException):
 class WhatsAppClientError(BotWppException):
     """Raised when interaction with the WhatsApp gateway (Evolution API) fails."""
     pass
+
+
+class ServiceTimeoutError(BotWppException):
+    """Raised when an external call (LLM, transcription or storage) exceeds its time budget."""
+    pass

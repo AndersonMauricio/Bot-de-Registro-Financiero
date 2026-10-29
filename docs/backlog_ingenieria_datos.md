@@ -13,6 +13,8 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 | 5 | Data Serving: reportes por demanda en Drive | ✅ (probado con dobles, **no contra Google real**) | Habilitar la Drive API del proyecto de GCP; opcional `REPORTS_FOLDER_ID` |
 | 6 | Esquema de las pestañas `raw_expenses` y `usuarios` | ✅ | Reemplazar los encabezados de `raw_expenses` por los nuevos: [sheets_schema.md](sheets_schema.md) |
 | 7 | Edición y corrección de registros (update por cita) | ✅ | Agregar la columna `reply_message_id` a `raw_expenses` (o `ALTER TABLE` en PostgreSQL): [sheets_schema.md](sheets_schema.md) |
+| 8 | Gastos múltiples por mensaje (batching) | ✅ | Nada. El `message_id` del lote se sufija `-0`, `-1`, … sin cambios de esquema |
+| 9 | Degradación controlada ante caídas de servicios | ✅ | Opcional: ajustar `GROQ_TIMEOUT_SECONDS`, `STORAGE_TIMEOUT_SECONDS`, `HTTP_TIMEOUT_SECONDS` y `MAX_TRANSACTIONS_PER_MESSAGE` en el `.env` |
 
 ### Decisiones de implementación
 
@@ -22,6 +24,11 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 - **Punto 6:** `Fecha_Registro` se genera cuando el bot ve el número por primera vez, y desaparece `fecha_actualizacion`. Las pestañas con los nombres de la versión anterior (`nombre_completo`, `fecha_alta`) siguen funcionando. `raw_expenses` se escribe por nombre de columna y, si falta alguna de las 10 obligatorias, el bot se niega a guardar en vez de desalinear datos. La idempotencia por `message_id` ahora sobrevive a reinicios.
 - **Punto 7 – "update por cita":** la fila se identifica por `message_id` **o** por `reply_message_id` (el ID de la confirmación que envía el bot, capturado de la respuesta de `message/sendText`), siempre filtrada por `user_phone_hash`: no existe forma de editar un gasto ajeno aunque se conozca el ID. El `UPDATE` sobrescribe solo las 7 columnas de datos; `message_id`, `timestamp` y el hash no se tocan. Una cita que no resuelve **no** se registra como gasto nuevo: el bot pide aclaración.
 - **Punto 7 – corrección sin cita:** una frase como *"me equivoqué, eran 155"* se detecta con una regla determinista (`edit_intent.py`, sin LLM) y se responde pidiendo que cite el mensaje: antes caía en la extracción normal y devolvía un error técnico de confianza. Además, la moneda y la fecha solo cambian si el mensaje las menciona explícitamente (guarda en el servicio, independiente del LLM).
+- **Punto 8 – contrato tolerante:** `LLMExtractionResponse` expone `transactions` (lista) y mantiene `transaction` como vista legacy sincronizada. Así la rama de corrección, los few-shots viejos y los consumes externos siguen funcionando sin migración.
+- **Punto 8 – validación y escritura por ítem:** las restricciones duras (monto > 0, moneda ISO, detalle no vacío) se movieron del modelo Pydantic al Data Quality Gate. Con el modelo estricto, un solo ítem inválido hacía fallar todo el mensaje; ahora el gate valida cada gasto y el lote escribe solo los válidos en una única operación.
+- **Punto 8 – ids:** un gasto usa el `message_id` original; un lote usa `-0`, `-1`, … La idempotencia reconoce el id base y sus sufijos, así una reentrega del webhook no duplica nada.
+- **Punto 9 – timeouts:** el SDK de Groq arranca con 600 s de espera; ahora LLM y Whisper usan `GROQ_TIMEOUT_SECONDS` (30 s) + `GROQ_MAX_RETRIES`, y todo se ejecuta con `run_blocking` (cota dura por llamada). Evolution usa `HTTP_TIMEOUT_SECONDS`.
+- **Punto 9 – mensajes honestos:** se distingue "no se guardó nada" (falla de escritura) de "puede que no se haya guardado" (timeout de escritura: la cancelación de `asyncio` no detiene el hilo).
 
 ### Riesgos a tener presentes
 
@@ -33,6 +40,10 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 - **La edición no tiene ventana temporal:** el usuario puede reescribir un gasto de hace meses. Se decidió así para el MVP; un límite (por ejemplo 30 días) es una línea de configuración.
 - **Citar la confirmación del bot depende de una columna nueva:** en una hoja sin `reply_message_id` solo se pueden corregir los gastos respondiendo al mensaje propio del usuario. La degradación es silenciosa (un warning en el log), nunca rompe el registro.
 - **Se recuerda una sola confirmación por gasto:** `reply_message_id` se sobrescribe en cada corrección, así que citar una confirmación anterior no resuelve. Guardar un historial de IDs exigiría otra tabla (o un valor multi-valor), que se dejó fuera del MVP.
+- **Un lote comparte una única confirmación:** por eso la corrección dentro de un lote pasa por una lista numerada y una selección pendiente en memoria (`PENDING_SELECTION_TTL_SECONDS`). Si el proceso se reinicia entre la pregunta y la respuesta, la selección se pierde y hay que volver a citar.
+- **La selección pendiente vive en el proceso:** igual que la caché de usuarios, no se comparte entre workers. El bot ya exige un solo worker de uvicorn.
+- **El lote es todo o nada en la escritura:** no hay transacción en Sheets, así que la escritura es un único `append_rows`; si falla, el usuario recibe "no se guardó nada" y puede reenviar sin riesgo de filas huérfanas.
+- **La confianza es del mensaje, no del ítem:** `confidence_score` es global, así que un mensaje confuso invalida todos sus gastos aunque los montos se hayan leído bien.
 
 ---
 
@@ -100,3 +111,19 @@ Estructura obligatoria para gestionar los accesos:
   2. El LLM recibe el registro original y el mensaje de corrección (`EDIT_SYSTEM_PROMPT`), devolviendo el mismo contrato JSON con solo los campos corregidos.
   3. La validación es la misma del alta (Data Quality Gate) y se sobrescriben únicamente las columnas de datos; la identidad de la fila (`message_id`, `user_phone_hash`) y el `timestamp` de ingesta quedan intactos.
 * **Trazabilidad del hilo:** el bot responde citando el mensaje del usuario y guarda el ID de su propia respuesta en `reply_message_id`, de modo que la siguiente corrección puede citar esa confirmación.
+
+
+## 8. Soporte para Gastos Múltiples (Batching)
+**Objetivo:** Procesar notas de voz o textos largos con más de una transacción en un solo envío.
+
+* **Contrato:** el LLM devuelve `transactions` (lista, minItems 1, maxItems `MAX_TRANSACTIONS_PER_MESSAGE`) en lugar de un objeto único `transaction`; la clave vieja se acepta por compatibilidad.
+* **Calidad de datos:** `DataQualityGate.validate_transactions` valida cada gasto por separado y asigna `message_id` = `<id>` para un gasto único o `<id>-0`, `<id>-1`, … para un lote.
+* **Persistencia:** una sola escritura por lote (`append_rows` en Sheets, `INSERT` multi-fila en PostgreSQL); si falla no se guarda ninguna fila y el usuario lo sabe.
+* **Confirmación numerada** y corrección por selección cuando la cita corresponde a un lote.
+
+## 9. Graceful Degradation (Manejo de Errores y Contingencia)
+**Objetivo:** Evitar fallas silenciosas: si un servicio externo se cae, el usuario debe saber que su gasto NO fue registrado.
+
+* **Timeouts explícitos:** `GROQ_TIMEOUT_SECONDS` y `GROQ_MAX_RETRIES` en los SDK de Groq/Whisper, `HTTP_TIMEOUT_SECONDS` en Evolution y `STORAGE_TIMEOUT_SECONDS` en el repositorio.
+* **Cota dura por llamada:** `run_blocking` envuelve cada llamada bloqueante con `asyncio.wait_for`, de modo que ninguna caída deja al usuario esperando.
+* **Mensajes por clase de falla:** IA caída, base caída ("no se guardó nada"), timeout de escritura ("puede que no se haya guardado") y excepción no prevista (mensaje genérico del router con log contextual).

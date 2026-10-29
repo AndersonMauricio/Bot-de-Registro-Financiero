@@ -37,7 +37,12 @@ class WhisperClient:
         key = api_key or settings.GROQ_API_KEY.get_secret_value()
         if not key:
             logger.warning("GROQ_API_KEY is missing for WhisperClient.")
-        self.client = Groq(api_key=key) if key else None
+        # Same bounded budget as the LLM: a stuck transcription must not hang the conversation
+        self.client = (
+            Groq(api_key=key, timeout=settings.GROQ_TIMEOUT_SECONDS, max_retries=settings.GROQ_MAX_RETRIES)
+            if key
+            else None
+        )
 
     def transcribe_audio_bytes(
         self,

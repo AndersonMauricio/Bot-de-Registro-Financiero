@@ -17,7 +17,7 @@ timestamp, message_id, user_phone_hash, fecha_gasto, monto, moneda, categoria, s
 | Orden | Columna | Tipo lógico | Descripción | Ejemplo |
 | :---: | :--- | :--- | :--- | :--- |
 | 1 | `timestamp` | DATETIME | Fecha y hora de ingesta, en la zona horaria `TIMEZONE` (`YYYY-MM-DD HH:mm:ss`) | `2026-10-19 22:50:00` |
-| 2 | `message_id` | TEXT | ID único del mensaje de Evolution API. Es la **llave de idempotencia**: evita registrar dos veces un mensaje reentregado, incluso después de reiniciar el bot | `3EB0A1B2C3D4E5F60001` |
+| 2 | `message_id` | TEXT | ID único del mensaje de Evolution API. Es la **llave de idempotencia**: evita registrar dos veces un mensaje reentregado, incluso después de reiniciar el bot. Si un mensaje describe **varios gastos**, cada fila usa el mismo ID con sufijo `-0`, `-1`, … | `3EB0A1B2C3D4E5F60001` o `3EB0A1B2C3D4E5F60001-1` |
 | 3 | `user_phone_hash` | TEXT (64) | Hash SHA-256 del número del remitente. **El número nunca se escribe en claro** en esta pestaña; el hash permite filtrar los gastos de cada persona | `9f86d081884c7d65...` |
 | 4 | `fecha_gasto` | DATE | Fecha real del gasto, resuelta por el LLM (por ejemplo, "ayer") | `2026-10-18` |
 | 5 | `monto` | NUMERIC | Valor numérico con punto decimal | `4500.00` |
@@ -83,6 +83,19 @@ El bot escribe estos valores sin interpretarlos (`RAW`) y antepone `'` a textos 
 
 ---
 
+## 🧾 Varios gastos en un solo mensaje
+
+Un texto o una nota de voz puede describir más de un gasto ("20.000 de pochoclos y 5.000 de estacionamiento"). El LLM los devuelve como una lista y el bot escribe **una fila por gasto**:
+
+1. Cada fila lleva el `message_id` del mensaje con sufijo (`3EB0...-0`, `3EB0...-1`, …), así se distinguen sin cambiar el esquema.
+2. Las filas se escriben en **una sola operación** (`append_rows`): si la escritura falla, no queda ninguna fila a medias.
+3. `reply_message_id` es el mismo en todas las filas del lote (la confirmación es una sola), por eso al citar esa confirmación el bot muestra la lista numerada para elegir cuál corregir.
+4. Un mensaje con un solo gasto sigue usando el `message_id` sin sufijo, así las filas anteriores no cambian.
+
+Límite: `MAX_TRANSACTIONS_PER_MESSAGE` (10 por defecto). Un mensaje con más gastos se rechaza pidiendo dividirlo.
+
+---
+
 ## ✏️ Edición y corrección de registros (modo edición por cita)
 
 Un usuario aprobado puede corregir un gasto ya registrado **respondiendo (citando) un mensaje del bot**, sin crear una fila nueva:
@@ -103,6 +116,7 @@ Cómo funciona:
 Reglas y límites:
 
 - Si el mensaje citado **no** corresponde a un gasto del remitente, el bot pide que aclare y **no** registra nada (nunca inventa una fila).
+- Si la confirmación citada corresponde a un **lote**, el bot lista los gastos numerados y acepta `el 2 eran 6000` (o el mismo texto citando, en un solo paso).
 - Si el usuario escribe una corrección **sin citar** (*"me equivoqué, eran 155"*), el bot lo detecta, avisa que no registró nada y pide que responda citando la confirmación (o el mensaje original).
 - Se recuerda solo la **última** confirmación de cada gasto: para corregirlo otra vez hay que citar esa, no una confirmación anterior.
 - Si la corrección no aporta un dato concreto ("me equivoqué" sin decir qué), la confianza queda por debajo del umbral y el bot pide el dato faltante.

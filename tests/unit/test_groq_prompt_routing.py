@@ -151,9 +151,12 @@ def test_the_few_shot_examples_only_use_taxonomy_values_and_always_include_the_p
     for message in FEW_SHOT_EXAMPLES:
         if message["role"] != "assistant":
             continue
-        transaction = json.loads(message["content"])["transaction"]
-        assert CategoryEnum(transaction["category"]).value == transaction["category"]
-        assert PaymentMethodEnum(transaction["payment_method"]).value == transaction["payment_method"]
+        payload = json.loads(message["content"])
+        transactions = payload.get("transactions") or [payload["transaction"]]
+        assert transactions, "every example must describe at least one expense"
+        for transaction in transactions:
+            assert CategoryEnum(transaction["category"]).value == transaction["category"]
+            assert PaymentMethodEnum(transaction["payment_method"]).value == transaction["payment_method"]
 
 
 def test_the_json_contract_matches_the_enums():
@@ -161,10 +164,13 @@ def test_the_json_contract_matches_the_enums():
     from src.domain.enums import CategoryEnum, PaymentMethodEnum
 
     contract = json.loads(pathlib.Path("docs/data_contract.json").read_text(encoding="utf-8"))
-    transaction = contract["properties"]["transaction"]
+    transaction = contract["definitions"]["transaction"]
     assert transaction["properties"]["category"]["enum"] == [c.value for c in CategoryEnum]
     assert transaction["properties"]["payment_method"]["enum"] == [m.value for m in PaymentMethodEnum]
     assert "payment_method" in transaction["required"]
+    # the batch contract points at that same definition for every item
+    assert contract["properties"]["transactions"]["items"] == {"$ref": "#/definitions/transaction"}
+    assert contract["properties"]["transactions"]["minItems"] == 1
 
 
 def test_the_onboarding_prompt_asks_for_a_gmail_address_in_both_the_field_definition_and_the_reply_rule():

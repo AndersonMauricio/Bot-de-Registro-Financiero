@@ -9,13 +9,25 @@ class ExpenseRepositoryInterface(ABC):
     """Abstract interface for persisting expense records."""
 
     @abstractmethod
-    def save_expense(self, record: ExpenseRecord) -> str:
-        """Persist an expense record and return its internal/assigned ID."""
+    def save_expenses(self, records: list[ExpenseRecord]) -> list[str]:
+        """Persist a batch of expenses with a single write and return their assigned ids, in order.
+
+        The whole batch is written or nothing is: on failure it raises StorageError, so the caller can
+        tell the user that nothing was saved instead of guessing which rows made it.
+        """
         pass
+
+    def save_expense(self, record: ExpenseRecord) -> str:
+        """Persist one expense (convenience wrapper around `save_expenses`)."""
+        return self.save_expenses([record])[0]
 
     @abstractmethod
     def is_message_processed(self, message_id: str) -> bool:
-        """Check whether a message_id was already persisted (idempotency check)."""
+        """Check whether a message_id was already persisted (idempotency check).
+
+        A message that described several expenses is stored as `<message_id>-0`, `<message_id>-1`, ...,
+        so the base id counts as processed when any of those rows exists.
+        """
         pass
 
     @abstractmethod
@@ -27,14 +39,18 @@ class ExpenseRepositoryInterface(ABC):
         pass
 
     @abstractmethod
-    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
-        """Return one of this user's own expenses by its incoming message id or the bot reply id.
+    def find_expenses_by_message_id(self, message_id: str, user_phone_hash: str) -> list[dict]:
+        """All of this user's own expenses cited by an incoming message id or the bot reply id.
 
-        Keys: the EXPENSE_SHEET_HEADERS names the storage holds (always message_id, fecha_gasto, monto,
-        moneda, categoria, subcategoria, medio_de_pago and descripcion). None when the id is unknown or
-        belongs to another user.
+        A batch shares the id of its single confirmation, so this can legitimately return several rows
+        (ordered as stored). Empty when the id is unknown or belongs to another user.
         """
         pass
+
+    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
+        """First expense cited by `message_id` (convenience wrapper around `find_expenses_by_message_id`)."""
+        matches = self.find_expenses_by_message_id(message_id, user_phone_hash)
+        return matches[0] if matches else None
 
     @abstractmethod
     def update_expense(self, record: ExpenseRecord) -> bool:
@@ -49,6 +65,16 @@ class ExpenseRepositoryInterface(ABC):
     def set_reply_message_id(self, message_id: str, reply_message_id: str, user_phone_hash: str) -> None:
         """Remember the id of the bot confirmation sent for that expense, so quoting it later resolves the row."""
         pass
+
+    def set_reply_message_ids(
+        self, message_ids: list[str], reply_message_id: str, user_phone_hash: str
+    ) -> None:
+        """Remember the same confirmation for several rows (a batch shares one confirmation).
+
+        Backends that can do it cheaper override this to write all cells in one operation.
+        """
+        for message_id in message_ids:
+            self.set_reply_message_id(message_id, reply_message_id, user_phone_hash)
 
 
 class UserRepositoryInterface(ABC):

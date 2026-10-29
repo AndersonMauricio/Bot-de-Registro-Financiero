@@ -99,15 +99,17 @@ bot-wpp/
 ├── src/
 │   ├── main.py                    # Aplicación FastAPI
 │   ├── api/v1/                    # webhooks.py (Evolution y Sheets), health.py, dependencies.py
-│   ├── core/                      # Configuración, logging, excepciones y helpers de teléfono
+│   ├── core/                      # Configuración, logging, excepciones y helpers de teléfono/async
 │   ├── domain/                    # Enums y modelos Pydantic
 │   ├── services/
 │   │   ├── message_router.py      # Ruteo por estado del número (1 / 2 / vacío)
 │   │   ├── onboarding_service.py  # Alta de usuarios desconocidos
-│   │   ├── expense_service.py     # Registro de gastos (usuarios aprobados)
+│   │   ├── expense_service.py     # Registro de gastos (uno o varios por mensaje) y correcciones
 │   │   ├── report_intent.py       # Detección de pedidos de reporte
+│   │   ├── edit_intent.py         # Detección determinista de correcciones y de la opción elegida
+│   │   ├── batch_selection.py     # Lista numerada pendiente cuando un lote tiene varios gastos
 │   │   ├── report_service.py      # Reporte por demanda (aislado por usuario)
-│   │   └── data_quality.py        # Data Quality Gate
+│   │   └── data_quality.py        # Data Quality Gate (validación por gasto)
 │   └── infrastructure/
 │       ├── whatsapp/              # Cliente y parser de Evolution API
 │       ├── llm/                   # Cliente de Groq y prompts (onboarding / extracción / corrección)
@@ -162,23 +164,36 @@ Para evitar alucinaciones, el LLM responde bajo un esquema estricto JSON. Este c
 {
   "metadata": {
     "confidence_score": 0.95,
-    "raw_text": "Cena de negocios en La Cabrera por 45.000 ARS pagado con tarjeta de crédito"
+    "raw_text": "Anotá 20.000 de pochoclos y, a la salida, pagué 5.000 de estacionamiento"
   },
-  "transaction": {
-    "transaction_date": "2026-10-19",
-    "transaction_time": "21:15:00",
-    "amount": 45000.00,
-    "currency": "ARS",
-    "category": "Alimentación",
-    "subcategory": "Restaurante",
-    "merchant_name": "La Cabrera",
-    "payment_method": "Tarjeta de Crédito",
-    "description": "Cena de negocios"
-  }
+  "transactions": [
+    {
+      "transaction_date": "2026-10-19",
+      "transaction_time": null,
+      "amount": 20000.00,
+      "currency": "ARS",
+      "category": "Entretenimiento",
+      "subcategory": "Cine",
+      "merchant_name": null,
+      "payment_method": "Tarjeta de Débito",
+      "description": "Pochoclos"
+    },
+    {
+      "transaction_date": "2026-10-19",
+      "transaction_time": null,
+      "amount": 5000.00,
+      "currency": "ARS",
+      "category": "Transporte",
+      "subcategory": "Estacionamiento",
+      "merchant_name": null,
+      "payment_method": "Tarjeta de Débito",
+      "description": "Estacionamiento"
+    }
+  ]
 }
 ```
 
-> Consultá el esquema formal en [`docs/data_contract.json`](docs/data_contract.json).
+> Consultá el esquema formal en [`docs/data_contract.json`](docs/data_contract.json). El contrato devuelve siempre una lista `transactions` (un elemento por gasto, máximo `MAX_TRANSACTIONS_PER_MESSAGE`) y sigue aceptando la clave antigua `transaction` con un solo gasto.
 
 La taxonomía es **estrictamente en español** y `payment_method` es obligatorio:
 - **Categorías:** `Alimentación`, `Transporte`, `Vivienda`, `Servicios`, `Salud`, `Entretenimiento`, `Educación`, `Compras`, `Otros`.
@@ -187,6 +202,44 @@ La taxonomía es **estrictamente en español** y `payment_method` es obligatorio
 Se toleran diferencias de mayúsculas y tildes (`ALIMENTACION` → `Alimentación`), pero un valor fuera de la taxonomía se rechaza. Los enums, el prompt y el contrato JSON se mantienen sincronizados con un test.
 
 El onboarding tiene su propio contrato, definido en `ONBOARDING_SYSTEM_PROMPT`: `{"collected": {"full_name", "email"}, "reply"}`. El LLM solo extrae datos y redacta la próxima pregunta; el aviso final de aprobación manual es texto fijo.
+
+---
+
+## 🧾 Gastos Múltiples en un Solo Mensaje
+
+Un texto o una nota de voz puede describir varios gastos. El LLM devuelve una lista y el bot registra **una fila por gasto**, con una única confirmación numerada:
+
+```text
+Usuario: Anotá 20.000 de pochoclos y, a la salida, pagué 5.000 de estacionamiento con débito.
+Bot:     ✅ Se registraron 2 gastos:
+
+         1. Entretenimiento (Cine) — 20,000.00 ARS · Pochoclos
+         2. Transporte (Estacionamiento) — 5,000.00 ARS
+
+         📅 2026-10-29 · 💳 Tarjeta de Débito
+```
+
+- **Trazabilidad:** cada fila usa el `message_id` original con un sufijo (`<message_id>-0`, `<message_id>-1`, …). Un mensaje con un solo gasto conserva el `message_id` sin sufijo.
+- **Escritura atómica:** las filas del lote se escriben en **una sola llamada** (`append_rows` en Sheets, un `INSERT` en Postgres): o se guardan todas o ninguna.
+- **Ítems inválidos:** si un gasto del lote no pasa el Data Quality Gate, se guardan los demás y la respuesta detalla cuáles no y por qué.
+- **Corrección dentro de un lote:** al citar una confirmación con varios gastos el bot pide cuál corregir y acepta `el 2 eran 6000` (o directamente `el 2 eran 6000` citando la confirmación, en un solo paso).
+
+---
+
+## 🛡️ Degradación Controlada (fallas de servicios externos)
+
+Ninguna falla queda en silencio: si algo externo se cae, el usuario recibe un mensaje claro que dice si su gasto se guardó o no.
+
+| Situación | Mensaje al usuario |
+| :--- | :--- |
+| Groq (LLM) responde con error | ⚠️ Ocurrió un error en el servidor de inteligencia artificial. Tu gasto **no fue guardado**. Intentá de nuevo en unos minutos. |
+| Groq tarda más de `GROQ_TIMEOUT_SECONDS` | ⚠️ El servidor de inteligencia artificial **tardó demasiado**. Tu gasto no fue guardado. |
+| Sheets/Postgres falla al escribir | ⚠️ No pude guardar tu registro en la base de datos. **No se guardó nada**. Conservá el ticket o intentá en un rato. |
+| La base no responde a tiempo | ⚠️ La base de datos **no respondió a tiempo**: puede que no se haya guardado. Verificá con "quiero mi resumen". |
+| Whisper no puede transcribir | ⚠️ No pudimos procesar el audio. **No se registró nada**: reenvialo o escribilo. |
+| Excepción no prevista | ⚠️ Ocurrió un error inesperado… (log con contexto, sin datos sensibles) |
+
+Todas las llamadas bloqueantes (Groq, Whisper, repositorio) corren en un hilo con un **tiempo máximo** ([`run_blocking`](src/core/async_utils.py)), y los SDK se configuran con timeouts explícitos: por defecto el cliente de Groq espera 600 s, que dejaría al usuario sin respuesta.
 
 ---
 
@@ -207,6 +260,7 @@ Bot:     ✏️ Registro modificado · Monto: 15,000.00 ARS (antes 1,500.00 ARS)
 - **Corrección:** el LLM recibe el registro actual + el mensaje del usuario (`EDIT_SYSTEM_PROMPT`) y devuelve el contrato JSON completo cambiando **solo** los campos corregidos. La validación es la misma del alta (Data Quality Gate).
 - **Persistencia:** se sobrescriben únicamente las columnas de datos. `message_id` (idempotencia), `timestamp` (ingesta) y `user_phone_hash` quedan intactos.
 - **Cita no reconocida:** el bot pide que aclare y **no** registra nada, para no ensuciar la base con filas inventadas.
+- **Corrección dentro de un lote:** si la confirmación citada corresponde a varios gastos, el bot muestra la lista numerada y acepta `el 2 eran 6000` (o el mismo texto al citar, en un solo paso).
 - **Corrección sin cita:** si el usuario escribe *"me equivoqué, eran 155"* sin responder a un mensaje, el bot lo detecta (regla determinista, sin LLM), **no registra nada** y le pide que cite la confirmación. Antes ese mensaje terminaba en un error técnico de validación.
 - **Solo cambia lo que el usuario menciona:** si la corrección no dice la moneda ni la fecha, se conservan las del registro (un *"eran 155"* sobre un gasto de 15 USD queda en 155 USD, nunca pasa a ARS por el valor por defecto).
 - **Última confirmación:** se recuerda solo el ID de la última respuesta del bot para cada gasto, así que las correcciones en cadena se hacen citando esa.
@@ -223,7 +277,7 @@ Bot:     ✏️ Registro modificado · Monto: 15,000.00 ARS (antes 1,500.00 ARS)
 | Columna | Descripción | Ejemplo |
 | :--- | :--- | :--- |
 | `timestamp` | Fecha y hora de ingesta, en la zona horaria `TIMEZONE` (`YYYY-MM-DD HH:mm:ss`) | `2026-10-19 22:50:00` |
-| `message_id` | ID único del mensaje de Evolution API: llave de idempotencia (sobrevive a reinicios) | `3EB0A1B2C3D4E5F60001` |
+| `message_id` | ID único del mensaje de Evolution API: llave de idempotencia (sobrevive a reinicios). En un lote se sufija `-0`, `-1`, … | `3EB0A1B2C3D4E5F60001` |
 | `user_phone_hash` | SHA-256 del número del remitente: vincula cada gasto con su dueño sin exponer el teléfono | `9f86d081884c7d65...` |
 | `fecha_gasto` | Fecha real del gasto resuelta por el LLM (por ejemplo, "ayer") | `2026-10-18` |
 | `monto` | Valor numérico con punto decimal | `4500.00` |
@@ -274,6 +328,7 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viv
 6. **Protección contra inyección de fórmulas:** si un campo de texto inicia con `=`, `+`, `-` o `@`, se antepone `'` para prevenir ejecución maliciosa en hojas de cálculo. El mismo tratamiento se aplica a los datos de onboarding.
 7. **Privacidad (PII):** el número telefónico se persiste hasheado (SHA-256) en `user_phone_hash` y los logs lo enmascaran. Los reportes filtran **solo** por ese hash.
 8. **Taxonomía en español:** la categoría y el medio de pago deben pertenecer a las listas de arriba; `payment_method` es obligatorio.
+9. **Uno o varios gastos:** la validación es por gasto, así que un ítem inválido de un lote no bloquea a los demás; el bot informa exactamente qué se guardó y qué no. Un mensaje con más de `MAX_TRANSACTIONS_PER_MESSAGE` gastos se rechaza pidiendo dividirlo.
 
 ---
 

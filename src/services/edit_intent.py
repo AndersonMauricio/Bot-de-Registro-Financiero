@@ -9,6 +9,7 @@ Deterministic on purpose (no LLM call), like the report-intent detection.
 
 import re
 import unicodedata
+from typing import Optional
 
 # A correction is a short remark about a record; long texts are new expenses or explanations
 MAX_WORDS = 25
@@ -71,3 +72,33 @@ def mentions_currency(text: str) -> bool:
 def mentions_date(text: str) -> bool:
     """True when the user says which date they mean (so the stored one may be replaced)."""
     return bool(_DATE_MENTION.search(_normalize(text or "")))
+
+
+# "la opción 2", "el gasto 2", "el 2", "2)", "2 -", "2:" or just "2"
+_SELECTION_WITH_NOUN = re.compile(
+    r"^\s*(?:(?:el|la|los|las)\s+)?(?:opci[oó]n|n[uú]mero|gasto|[íi]tem|item)\s+(\d{1,2})(?!\d)"
+    r"\s*[).:,;\-]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SELECTION_WITH_ARTICLE = re.compile(
+    r"^\s*(?:el|la|los|las)\s+(\d{1,2})(?!\d)\s*[).:,;\-]?\s*(.*)$", re.IGNORECASE | re.DOTALL
+)
+_SELECTION_WITH_SEPARATOR = re.compile(r"^\s*(\d{1,2})(?!\d)\s*[).:,;\-]\s*(.*)$", re.DOTALL)
+_SELECTION_ONLY = re.compile(r"^\s*(\d{1,2})(?!\d)\s*$")
+
+
+def parse_selection(text: str) -> tuple[Optional[int], str]:
+    """Interpret a reply to a numbered list as (1-based option, remaining correction text).
+
+    Returns (None, text) when the message does not name an option, so a plain correction or a new
+    expense ("2 cafés y 3 medialunas") is never mistaken for a choice.
+    """
+    raw = text or ""
+    for pattern in (_SELECTION_WITH_NOUN, _SELECTION_WITH_ARTICLE, _SELECTION_WITH_SEPARATOR):
+        match = pattern.match(raw)
+        if match:
+            return int(match.group(1)), match.group(2).strip()
+    match = _SELECTION_ONLY.match(raw)
+    if match:
+        return int(match.group(1)), ""
+    return None, raw.strip()

@@ -35,7 +35,7 @@ flowchart LR
    | `EVOLUTION_INSTANCE` | `bot-wpp` | El nombre que le des a la instancia en el Paso 2. |
    | `EVOLUTION_WEBHOOK_SECRET` | una clave larga aleatoria | `python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
 
-   Opcionales: `SHEETS_WEBHOOK_SECRET` (aprobaciones en tiempo real, requiere una URL pública: ver [apps_script_usuarios.md](apps_script_usuarios.md)), `REPORTS_FOLDER_ID` y `REPORT_COOLDOWN_SECONDS`.
+   Opcionales: `SHEETS_WEBHOOK_SECRET` (aprobaciones en tiempo real, requiere una URL pública: ver [apps_script_usuarios.md](apps_script_usuarios.md)), `REPORTS_FOLDER_ID`, `REPORT_COOLDOWN_SECONDS`, y los límites de robustez `GROQ_TIMEOUT_SECONDS`, `STORAGE_TIMEOUT_SECONDS`, `HTTP_TIMEOUT_SECONDS` y `MAX_TRANSACTIONS_PER_MESSAGE` (tienen valores por defecto razonables: no hace falta definirlos).
 
    El resto (`GROQ_API_KEY`, `GOOGLE_SHEETS_SHEET_ID` o `SPREADSHEET_ID`, `GOOGLE_SHEETS_TAB_NAME` o `WORKSHEET_NAME`, `POSTGRES_*`) ya debería estar. Las variables viejas `N8N_*`, `WEBHOOK_URL` y `WHATSAPP_*` no se usan más: podés borrarlas (y revocar el token de Meta).
 3. **Google Sheets.**
@@ -172,9 +172,10 @@ Dejá los logs abiertos con `docker compose logs -f app` y, **desde el segundo t
 3. Esperá hasta **60 segundos** (el bot cachea la lista de usuarios) y mandá *"Gasté 15 USD en almuerzo con débito"* → responde "✅ Gasto Registrado con Éxito" y aparece una fila en `raw_expenses`.
 4. **Corregí ese gasto**: respondé (citando) el mensaje de confirmación del bot con *"me equivoqué, eran 150 USD"* → responde "✏️ Registro modificado" y la fila se actualiza **en el lugar** (no aparece una fila nueva). Requiere la columna `reply_message_id` en la hoja.
 5. Mandá una **nota de voz** con un gasto: se transcribe con Whisper y se registra igual.
-6. Cambiá `estado` a **`2`** (rechazado), esperá la caché y escribí de nuevo → responde "⛔ Acceso denegado".
+6. **Probá un lote**: escribí *"Anotá 20.000 de pochoclos y pagué 5.000 de estacionamiento con débito"* → responde "✅ Se registraron 2 gastos" y aparecen **dos filas** con `message_id` terminados en `-0` y `-1`. Si citás esa confirmación y escribís *"el 2 eran 6000"*, corrige solo la segunda.
+7. Cambiá `estado` a **`2`** (rechazado), esperá la caché y escribí de nuevo → responde "⛔ Acceso denegado".
 
-7. Pedí tu **reporte** escribiendo *"quiero mi resumen"* (o por audio): el bot responde con el link a un Google Spreadsheet con **solo tus gastos**, compartido en solo lectura con el email que dejaste en el onboarding. Hay un enfriamiento de 5 minutos entre reportes.
+8. Pedí tu **reporte** escribiendo *"quiero mi resumen"* (o por audio): el bot responde con el link a un Google Spreadsheet con **solo tus gastos**, compartido en solo lectura con el email que dejaste en el onboarding. Hay un enfriamiento de 5 minutos entre reportes.
 
 Mientras Groq procesa, el chat muestra "escribiendo…".
 

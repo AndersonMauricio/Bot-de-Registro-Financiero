@@ -4,8 +4,15 @@ import hashlib
 import re
 from datetime import date
 from typing import Optional
+from src.core.config import settings
 from src.domain.enums import InputTypeEnum
-from src.domain.models import DataQualityResult, ExpenseRecord, LLMExtractionResponse
+from src.domain.models import (
+    DataQualityResult,
+    ExpenseRecord,
+    ExtractionMetadata,
+    ExtractedTransaction,
+    LLMExtractionResponse,
+)
 
 
 class DataQualityGate:
@@ -39,12 +46,69 @@ class DataQualityGate:
         user_phone: str,
         input_type: InputTypeEnum,
     ) -> DataQualityResult:
-        """Validate extraction output against business rules and return DataQualityResult."""
+        """Validate a single-expense extraction (correction branch). Returns the first result of the batch."""
+        return cls.validate_transactions(llm_response, message_id, user_phone, input_type)[0]
+
+    @classmethod
+    def validate_transactions(
+        cls,
+        llm_response: LLMExtractionResponse,
+        message_id: str,
+        user_phone: str,
+        input_type: InputTypeEnum,
+    ) -> list[DataQualityResult]:
+        """Validate and sanitize every expense of the message, one result per transaction in order.
+
+        Each record gets its own id: a single expense keeps the message id (idempotency as before), while a
+        batch uses `<message_id>-0`, `<message_id>-1`, ... so every row stays individually addressable.
+        One invalid item does not invalidate the others: the caller decides what to do with each result.
+        """
+        meta = llm_response.metadata
+        transactions = llm_response.transactions
+
+        if not transactions:
+            return [
+                DataQualityResult(
+                    is_valid=False,
+                    confidence_score=meta.confidence_score,
+                    errors=["No se detectó ningún gasto en el mensaje."],
+                )
+            ]
+
+        if len(transactions) > settings.MAX_TRANSACTIONS_PER_MESSAGE:
+            return [
+                DataQualityResult(
+                    is_valid=False,
+                    confidence_score=meta.confidence_score,
+                    errors=[
+                        f"El mensaje describe {len(transactions)} gastos y el máximo por mensaje es "
+                        f"{settings.MAX_TRANSACTIONS_PER_MESSAGE}. Enviálos en mensajes separados."
+                    ],
+                )
+            ]
+
+        ids = (
+            [message_id]
+            if len(transactions) == 1
+            else [f"{message_id}-{index}" for index in range(len(transactions))]
+        )
+        return [
+            cls._validate_one(meta, tx, record_id, user_phone, input_type)
+            for tx, record_id in zip(transactions, ids)
+        ]
+
+    @classmethod
+    def _validate_one(
+        cls,
+        meta: ExtractionMetadata,
+        tx: ExtractedTransaction,
+        message_id: str,
+        user_phone: str,
+        input_type: InputTypeEnum,
+    ) -> DataQualityResult:
+        """Business rules for one transaction, plus the sanitized record ready to persist."""
         errors: list[str] = []
         warnings: list[str] = []
-
-        tx = llm_response.transaction
-        meta = llm_response.metadata
 
         # 1. Confidence Score Check
         if meta.confidence_score < cls.MIN_CONFIDENCE_THRESHOLD:
@@ -62,7 +126,11 @@ class DataQualityGate:
         if not cls.VALID_CURRENCY_REGEX.match(currency_clean):
             errors.append(f"La moneda '{tx.currency}' debe ser un código ISO 4217 de 3 letras mayúsculas.")
 
-        # 4. Future Date Check (Warning, not blocking)
+        # 4. Detail Validation
+        if not tx.description.strip():
+            errors.append("Falta el detalle (concepto) del gasto.")
+
+        # 5. Future Date Check (Warning, not blocking)
         today = date.today()
         if tx.transaction_date > today:
             warnings.append(
