@@ -1,15 +1,21 @@
 """Evolution API webhook endpoint: ingestion of WhatsApp messages (messages.upsert)."""
 
 import hmac
-from typing import Optional
+from typing import Optional, Union
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, field_validator
-from src.api.v1.dependencies import get_message_router, get_settings, get_user_repository
+from src.api.v1.dependencies import (
+    get_access_notifier,
+    get_message_router,
+    get_settings,
+    get_user_repository,
+)
 from src.core.config import Settings
 from src.core.logging import logger
 from src.core.phone import mask_phone, normalize_phone
 from src.infrastructure.storage.base import UserRepositoryInterface
 from src.infrastructure.whatsapp.parser import WhatsAppPayloadParser
+from src.services.access_notifier import AccessChange, AccessNotifier
 from src.services.message_router import MessageRouter
 
 router = APIRouter(prefix="/webhooks/evolution", tags=["Webhooks"])
@@ -84,41 +90,96 @@ async def receive_evolution_event(
     return {"status": "EVENT_RECEIVED"}
 
 
+def check_phone(raw: str) -> str:
+    """Normalize a phone to digits and reject values that cannot be a WhatsApp number."""
+    digits = normalize_phone(raw)
+    if not (6 <= len(digits) <= 20):
+        raise ValueError("phone must contain between 6 and 20 digits")
+    return digits
+
+
+class SheetChange(BaseModel):
+    """One edited row of the users tab: the phone and the `estado` cell, before and after the edit."""
+    phone: str
+    estado: Optional[Union[int, float, str]] = None
+    estado_anterior: Optional[Union[int, float, str]] = None
+
+    @field_validator("phone")
+    @classmethod
+    def phone_must_have_digits(cls, v: str) -> str:
+        return check_phone(v)
+
+
 class SheetsEvent(BaseModel):
     """Payload sent by the Apps Script trigger of the users tab."""
     event: str = "estado_changed"
     sheet: Optional[str] = None
     phone: Optional[str] = None
+    estado: Optional[Union[int, float, str]] = None
+    estado_anterior: Optional[Union[int, float, str]] = None
+    # Batch form: an edit that touched several rows, sent in one request
+    changes: list[SheetChange] = []
 
     @field_validator("phone")
     @classmethod
     def phone_must_have_digits(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return None
-        digits = normalize_phone(v)
-        if not (6 <= len(digits) <= 20):
-            raise ValueError("phone must contain between 6 and 20 digits")
-        return digits
+        return None if v is None else check_phone(v)
+
+
+def access_changes(payload: SheetsEvent) -> list[AccessChange]:
+    """Edits reported by the trigger, in either the single-phone or the batch form."""
+    if payload.changes:
+        return [
+            AccessChange.build(
+                phone=item.phone, estado=item.estado, estado_anterior=item.estado_anterior
+            )
+            for item in payload.changes
+        ]
+    if payload.phone:
+        return [
+            AccessChange.build(
+                phone=payload.phone,
+                estado=payload.estado,
+                estado_anterior=payload.estado_anterior,
+            )
+        ]
+    return []
 
 
 @sheets_router.post("", dependencies=[Depends(verify_sheets_secret)])
 async def receive_sheets_event(
     payload: SheetsEvent,
+    background_tasks: BackgroundTasks,
     settings: Settings = Depends(get_settings),
     user_repository: UserRepositoryInterface = Depends(get_user_repository),
+    access_notifier: AccessNotifier = Depends(get_access_notifier),
 ):
-    """An administrator edited the users tab: forget what is cached for that phone (or for everyone)."""
+    """An administrator edited the users tab: forget what is cached for that phone and tell the user.
+
+    The response is immediate (Apps Script has a short execution budget); the WhatsApp notice runs
+    afterwards and is decided by re-reading the sheet, so only a real `1` / `2` is ever announced.
+    """
     if payload.event == "ping":
         return {"status": "PONG"}
 
     if payload.sheet and payload.sheet != settings.USERS_WORKSHEET_NAME:
         return {"status": "IGNORED"}
 
-    if payload.phone:
-        user_repository.invalidate(payload.phone)
-        logger.info(f"Users cache invalidated for {mask_phone(payload.phone)}.")
-        return {"status": "INVALIDATED"}
+    changes = access_changes(payload)
+    if not changes:
+        user_repository.invalidate_all()
+        logger.info("Users cache invalidated for every user.")
+        return {"status": "INVALIDATED_ALL"}
 
-    user_repository.invalidate_all()
-    logger.info("Users cache invalidated for every user.")
-    return {"status": "INVALIDATED_ALL"}
+    if len(changes) > 1:
+        # A batch drops the whole snapshot once: the first notice's read refreshes every phone,
+        # instead of one forced read per row (Sheets read quota)
+        user_repository.invalidate_all()
+        logger.info(f"Users cache invalidated for {len(changes)} edited rows.")
+    else:
+        user_repository.invalidate(changes[0].phone)
+        logger.info(f"Users cache invalidated for {mask_phone(changes[0].phone)}.")
+
+    background_tasks.add_task(access_notifier.notify, changes)
+    return {"status": "INVALIDATED"}
+

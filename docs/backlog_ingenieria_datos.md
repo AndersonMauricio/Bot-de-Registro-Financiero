@@ -49,6 +49,8 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 
 ## 1. Arquitectura Event-Driven para Usuarios (Webhook de Estado)
 **Objetivo:** Eliminar las lecturas repetitivas y programadas a Google Sheets para evitar agotar la cuota de la API, reaccionando en tiempo real a las aprobaciones manuales.
+
+> ✅ **Implementado.** Ver el [disparador de Apps Script](../apps_script/usuarios_onedit.gs) y su [guía de instalación, diagnóstico y cuotas](apps_script_usuarios.md). Además de invalidar la caché, el bot ahora **le avisa al cliente por WhatsApp** cuando la cuenta se aprueba o se rechaza.
 * **Google Apps Script (onEdit):** Crear un disparador (trigger) en la pestaña `usuarios` de la hoja de control. Si se detecta un cambio en la columna de estado de un número, el script enviará un `POST` al servidor.
 * **FastAPI Endpoint:** Desarrollar una ruta interna (ej. `/api/v1/webhooks/sheets`) para recibir este evento.
 * **Invalidación de Caché:** Al recibir el payload con el número modificado, el backend elimina exclusivamente ese registro de su memoria caché.

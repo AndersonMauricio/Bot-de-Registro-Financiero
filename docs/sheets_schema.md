@@ -76,6 +76,7 @@ Cualquier otro valor en `Estado` (`3`, `aprobado`, texto libre…) se trata como
 2. A medida que la persona responde, el bot completa `Nombre` y `Email` en esa misma fila. Con los datos completos avisa que la cuenta está pendiente; mientras `Estado` siga vacío solo responde un recordatorio fijo.
 3. El administrador revisa la fila y completa `Estado` con `1` o `2`. También puede pre-aprobar a alguien agregando una fila con su `Telefono` y `Estado` = `1`.
 4. El cambio se aplica **al instante** si está instalado el [Apps Script](apps_script_usuarios.md); si no, en hasta `USER_CACHE_TTL_SECONDS` (60 s por defecto): el bot guarda la tabla en memoria para no agotar la cuota de lectura de la API de Sheets.
+5. Con el [Apps Script](apps_script_usuarios.md) instalado, el bot además **le escribe al cliente por WhatsApp**: `1` → "tu cuenta ya fue aprobada, ya podés registrar gastos"; `2` → "tu solicitud de acceso no fue aprobada". El aviso sale de releer esta pestaña, así que solo se anuncia el estado que realmente dice `Estado`.
 
 ### Privacidad
 La pestaña contiene teléfonos, nombres y emails en claro (necesarios para identificar a quien se aprueba): compartila solo con las personas que administran los accesos. Los emails se usan para compartir reportes: **el bot no verifica que la persona sea dueña de esa casilla**, así que el administrador debe confirmarlo al aprobar.

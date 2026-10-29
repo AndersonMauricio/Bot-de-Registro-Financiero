@@ -36,6 +36,7 @@ flowchart TD
         PEND --> USERS
         USERS -.->|"Apps Script onEdit"| HOOK["FastAPI: /api/v1/webhooks/sheets"]
         HOOK -.->|"invalida solo ese número"| ROUTER
+        HOOK -.->|"relee la hoja y avisa por WhatsApp"| WA
     end
 
     subgraph Expenses["3. Gastos y reportes (solo usuarios aprobados)"]
@@ -69,7 +70,7 @@ flowchart TD
 - **"Escribiendo…":** mientras Groq transcribe o procesa, el bot envía la presencia `composing` por Evolution y la corta justo antes de responder.
 - **Concurrencia:** se procesa un mensaje a la vez por número y se descartan las reentregas del webhook (mismo `message_id`).
 - **Audio:** se toma del base64 inline del webhook; si falta o viene corrupto, se descarga desde Evolution (`getBase64FromMediaMessage`) y se transcribe con Whisper.
-- **Aprobaciones en tiempo real:** un Apps Script en la hoja avisa a `/api/v1/webhooks/sheets` cuando se edita `Estado` y el bot olvida solo ese número ([guía](docs/apps_script_usuarios.md)). Si no se puede releer, falla cerrado.
+- **Aprobaciones en tiempo real:** un Apps Script en la hoja avisa a `/api/v1/webhooks/sheets` cuando se edita `Estado`: el bot olvida solo ese número y le escribe al cliente por WhatsApp para avisarle que ya puede registrar gastos (`1`) o que no fue aprobado (`2`) ([guía y diagnóstico](docs/apps_script_usuarios.md)). Si no se puede releer la hoja, no se avisa nada y el acceso falla cerrado.
 - **Reportes por demanda:** "quiero mi resumen" (texto o audio) no se registra como gasto: se genera un Spreadsheet con **solo los gastos de ese usuario** (filtro estricto por `user_phone_hash`) y se comparte en solo lectura con el email del onboarding.
 
 ---
@@ -85,11 +86,11 @@ bot-wpp/
 ├── docker/                        # Dockerfile y entrypoint
 ├── config/credentials/            # JSON de la cuenta de servicio de Google (ignorado por git)
 ├── apps_script/
-│   └── usuarios_onedit.gs         # Disparador de Google Apps Script (aprobaciones en tiempo real)
+│   └── usuarios_onedit.gs         # Disparador de Apps Script: aprobaciones al instante + aviso al cliente
 ├── docs/
 │   ├── data_contract.json         # JSON Schema formal del LLM
 │   ├── sheets_schema.md           # Diccionario de datos de Google Sheets (gastos, usuarios y reportes)
-│   ├── apps_script_usuarios.md    # Instalación del Apps Script
+│   ├── apps_script_usuarios.md    # Instalación, diagnóstico y cuotas del Apps Script
 │   ├── instructivo_docker.md      # Guía punta a punta con Docker
 │   └── instructivo_local.md       # Guía punta a punta en entorno local
 ├── scripts/
@@ -149,10 +150,28 @@ stateDiagram-v2
 ```
 
 - **Caché en memoria:** la lista de usuarios se lee de la hoja una vez cada `USER_CACHE_TTL_SECONDS` (60 s por defecto) y sirve a todos los mensajes, para no agotar la cuota de lectura de la API de Sheets.
-- **Aprobaciones en tiempo real (opcional):** con el [Apps Script](docs/apps_script_usuarios.md) instalado, aprobar o rechazar se aplica al instante y podés subir el TTL (por ejemplo a `3600`) para casi no leer la hoja. Sin él, el cambio tarda hasta el TTL en aplicarse.
+- **Aprobaciones en tiempo real (opcional):** con el [Apps Script](docs/apps_script_usuarios.md) instalado, aprobar o rechazar se aplica al instante y podés subir el TTL (`300` es un buen equilibrio; `3600` si el túnel es estable) para casi no leer la hoja. Sin él, el cambio tarda hasta el TTL en aplicarse.
+- **Aviso al cliente:** al editar `Estado`, el bot le escribe al usuario por WhatsApp: "tu cuenta ya fue aprobada, ya podés registrar gastos" (`1`) o "tu solicitud no fue aprobada" (`2`). El aviso se decide releyendo la hoja (nunca el payload), así que un secreto filtrado no sirve para mensajear a un número cualquiera, y no se repite si se vuelve a guardar el mismo valor.
 - **Prompts aislados:** el onboarding y la extracción de gastos usan prompts y ejemplos separados ([prompts.py](src/infrastructure/llm/prompts.py)); un usuario sin aprobar nunca llega al prompt de extracción.
 - **Un solo worker:** el control de duplicados, los locks por usuario y la caché viven en la memoria del proceso, así que ejecutá **un solo worker** de uvicorn (como hace el `Dockerfile`).
 - **Esquema de la pestaña:** [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-usuarios-control-de-acceso).
+
+### Cuotas y costos (Google)
+
+Todo el control de acceso es **gratuito**: la API de Google Sheets y Apps Script se miden por cuota, no por facturación (la única pieza paga del sistema es Groq, y este camino no la usa).
+
+| Recurso | Límite | Consumo real |
+| :--- | :--- | :--- |
+| Lecturas de Sheets API | 300/min por proyecto (60/min por usuario), **sin tope diario** | 1 por lote editado + 1 cuando vence el TTL con tráfico |
+| Escrituras de Sheets API | 300/min por proyecto | 1 por gasto guardado o alta de usuario |
+| Apps Script: tiempo de ejecución | 90 min/día (cuenta @gmail.com); 6 h/día en Workspace | ~1-2 s por edición → miles de ediciones por día |
+| Apps Script: llamadas externas | 20.000/día (100.000 en Workspace) | 1 por cada 50 filas editadas |
+
+Las lecturas son **perezosas**: no se lee cada 60 s, se lee cuando llega un mensaje y la caché venció. Si se supera la cuota, Sheets responde `429` y el bot **falla cerrado** ("no pudimos verificar tu acceso") hasta el minuto siguiente: nunca registra con datos viejos y no hay bloqueo de cuenta. Detalle en [Cuotas y costos](docs/apps_script_usuarios.md#cuotas-y-costos-google).
+
+**Elegir el TTL:** con el trigger instalado, `USER_CACHE_TTL_SECONDS` ya no es el mecanismo principal sino la red de seguridad para lo que no dispara `onEdit` (borrar filas, cambiar un teléfono, ediciones por API). `60` aplica esos cambios en ≤1 min, `300` en ≤5 min, `3600` en ≤1 h; todos están muy lejos de la cuota, así que elegí por velocidad de recuperación, no por miedo al límite.
+
+**Dos cuidados operativos:** (1) el túnel gratuito cambia de URL al reiniciar, así que activá las *notificaciones de fallos* del activador para enterarte; (2) aprobar muchas filas de golpe envía muchos WhatsApp seguidos: hacelo de a 10-20 por vez.
 
 ---
 
@@ -365,8 +384,8 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viv
    | `SPREADSHEET_ID` | ✅ | ID (o URL) del spreadsheet de Google. |
    | `WORKSHEET_NAME` | | Pestaña de gastos (por defecto `raw_expenses`). |
    | `USERS_WORKSHEET_NAME` | | Pestaña de usuarios (por defecto `usuarios`). |
-   | `USER_CACHE_TTL_SECONDS` | | Segundos que se cachea la lista de usuarios (por defecto `60`; con el Apps Script instalado podés subirlo a `3600`). |
-   | `SHEETS_WEBHOOK_SECRET` | | Secreto del Apps Script de aprobaciones en tiempo real. Sin él, `/api/v1/webhooks/sheets` rechaza todo. |
+   | `USER_CACHE_TTL_SECONDS` | | Segundos que se cachea la lista de usuarios (por defecto `60`). Con el Apps Script instalado podés subirlo: `300` es un buen equilibrio, `3600` si el túnel es estable 24/7 (ver [cuotas y costos](docs/apps_script_usuarios.md#cuotas-y-costos-google)). |
+   | `SHEETS_WEBHOOK_SECRET` | | Secreto del Apps Script de aprobaciones en tiempo real (el mismo valor en la propiedad `WEBHOOK_SECRET` del script). Sin él, `/api/v1/webhooks/sheets` rechaza todo con `503`. |
    | `REPORTS_FOLDER_ID` | | Carpeta de Drive (compartida con los administradores) donde se crean los reportes. Si falta, quedan en el Drive de la cuenta de servicio. |
    | `REPORT_COOLDOWN_SECONDS` | | Segundos mínimos entre dos reportes del mismo usuario (por defecto `300`). |
    | `GOOGLE_APPLICATION_CREDENTIALS` / `GCP_SERVICE_ACCOUNT_B64` | | Credenciales de la cuenta de servicio, si el `.json` no está en `config/credentials/` (donde se detecta solo). |
@@ -394,6 +413,11 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viv
    python scripts/setup_evolution_webhook.py --url https://<tu-dominio>/api/v1/webhooks/evolution
    ```
 6. **Probar:** agregá tu número a la pestaña `usuarios` con `estado` = `1` (o escribile al bot desde un número nuevo y aprobalo después) y enviá un mensaje: *"Gasté 15 USD en almuerzo con débito"*.
+7. **Avisos de aprobación (opcional):** instalá el [Apps Script de la hoja](docs/apps_script_usuarios.md) para que aprobar o rechazar se aplique al instante y el cliente reciba el aviso por WhatsApp. Ese script corre en los servidores de Google, así que **el bot necesita una URL pública HTTPS** (`localhost` o `host.docker.internal` no existen desde ahí) y hay que cargarle dos propiedades: `BOT_WEBHOOK_URL` (la URL pública + `/api/v1/webhooks/sheets`) y `WEBHOOK_SECRET` (el mismo valor que `SHEETS_WEBHOOK_SECRET`).
+   ```bash
+   ngrok http 8000        # copiá la URL https y usala en BOT_WEBHOOK_URL
+   ```
+   Una vez que `probarConexion()` responda `Conexión OK`, ajustá `USER_CACHE_TTL_SECONDS` según la tabla de arriba.
 
 ### Tests y diagnóstico
 ```bash

@@ -16,7 +16,7 @@ from src.services.data_quality import DataQualityGate
 PENDING_APPROVAL_MESSAGE = (
     "✅ ¡Gracias! Recibimos tus datos.\n\n"
     "Tu cuenta requiere aprobación manual del administrador antes de poder registrar gastos. "
-    "Una vez aprobada, vas a poder enviarme tus gastos por acá."
+    "Cuando la apruebe te voy a avisar por acá y vas a poder enviarme tus gastos."
 )
 PENDING_REMINDER_MESSAGE = (
     "⏳ Tu cuenta todavía está pendiente de aprobación por parte del administrador. "

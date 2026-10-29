@@ -36,6 +36,7 @@ class FakeWhatsApp:
         self.downloads: list[str] = []
         self.quoted_ids: list[Optional[str]] = []  # message answered by each reply, in order
         self.next_reply_id: Optional[str] = "bot-reply-1"
+        self.fail_sends = False  # simulate a WhatsApp gateway that does not deliver
 
     @property
     def sent(self) -> list[tuple[str, str]]:
@@ -57,6 +58,8 @@ class FakeWhatsApp:
         return bool(await self.send_reply(phone, text, quoted_message_id))
 
     async def send_reply(self, phone: str, text: str, quoted_message_id: Optional[str]) -> Optional[str]:
+        if self.fail_sends:
+            return None
         self.events.append(("send", phone, text))
         self.quoted_ids.append(quoted_message_id)
         return self.next_reply_id

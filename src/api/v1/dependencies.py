@@ -11,6 +11,7 @@ from src.infrastructure.storage.sheets_repo import GoogleSheetsExpenseRepository
 from src.infrastructure.storage.sheets_reports import GoogleSheetsReportPublisher
 from src.infrastructure.storage.sheets_users_repo import GoogleSheetsUserRepository
 from src.infrastructure.whatsapp.client import EvolutionAPIClient
+from src.services.access_notifier import AccessNotifier
 from src.services.expense_service import ExpenseProcessingService
 from src.services.message_router import MessageRouter
 from src.services.onboarding_service import OnboardingService
@@ -54,6 +55,15 @@ def get_expense_repository() -> ExpenseRepositoryInterface:
 def get_user_repository() -> UserRepositoryInterface:
     """Users always live in Google Sheets (cached in memory), whichever backend stores the expenses."""
     return GoogleSheetsUserRepository()
+
+
+@lru_cache()
+def get_access_notifier() -> AccessNotifier:
+    """Return the singleton notifier (it keeps the cache of phones already told about their state)."""
+    return AccessNotifier(
+        user_repository=get_user_repository(),
+        whatsapp_client=get_whatsapp_client(),
+    )
 
 
 @lru_cache()

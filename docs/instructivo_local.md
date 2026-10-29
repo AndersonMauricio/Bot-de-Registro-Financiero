@@ -45,7 +45,7 @@ flowchart LR
    | `EVOLUTION_INSTANCE` | `bot-wpp` | El nombre que le des a la instancia en el Paso 3. |
    | `EVOLUTION_WEBHOOK_SECRET` | una clave larga aleatoria | `python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
 
-   Opcionales: `SHEETS_WEBHOOK_SECRET` (aprobaciones en tiempo real, requiere una URL pública: ver [apps_script_usuarios.md](apps_script_usuarios.md)), `REPORTS_FOLDER_ID`, `REPORT_COOLDOWN_SECONDS`, y los límites de robustez `GROQ_TIMEOUT_SECONDS`, `STORAGE_TIMEOUT_SECONDS`, `HTTP_TIMEOUT_SECONDS` y `MAX_TRANSACTIONS_PER_MESSAGE` (tienen valores por defecto razonables: no hace falta definirlos).
+   Opcionales: `SHEETS_WEBHOOK_SECRET` (aprobaciones en tiempo real y aviso al cliente por WhatsApp; requiere una URL pública y el Apps Script: ver [apps_script_usuarios.md](apps_script_usuarios.md)), `REPORTS_FOLDER_ID`, `REPORT_COOLDOWN_SECONDS`, y los límites de robustez `GROQ_TIMEOUT_SECONDS`, `STORAGE_TIMEOUT_SECONDS`, `HTTP_TIMEOUT_SECONDS` y `MAX_TRANSACTIONS_PER_MESSAGE` (tienen valores por defecto razonables: no hace falta definirlos).
 
    El resto (`GROQ_API_KEY`, `GOOGLE_SHEETS_SHEET_ID` o `SPREADSHEET_ID`, `GOOGLE_SHEETS_TAB_NAME` o `WORKSHEET_NAME`) ya debería estar. Las variables viejas `N8N_*`, `WEBHOOK_URL` y `WHATSAPP_*` no se usan más: podés borrarlas (y revocar el token de Meta).
 
