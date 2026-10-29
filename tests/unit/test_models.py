@@ -5,7 +5,13 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 from src.domain.enums import CategoryEnum, InputTypeEnum, PaymentMethodEnum
-from src.domain.models import EXPENSE_SHEET_HEADERS, ExpenseRecord, ExtractedTransaction
+from src.domain.models import (
+    EXPENSE_SHEET_HEADERS,
+    OPTIONAL_EXPENSE_SHEET_HEADERS,
+    REQUIRED_EXPENSE_SHEET_HEADERS,
+    ExpenseRecord,
+    ExtractedTransaction,
+)
 
 
 def make_record(**overrides) -> ExpenseRecord:
@@ -34,14 +40,17 @@ def test_sheets_schema_matches_the_agreed_columns():
     assert EXPENSE_SHEET_HEADERS == [
         "timestamp", "message_id", "user_phone_hash", "fecha_gasto", "monto",
         "moneda", "categoria", "subcategoria", "medio_de_pago", "descripcion",
+        "reply_message_id",
     ]
+    assert "reply_message_id" not in REQUIRED_EXPENSE_SHEET_HEADERS
+    assert set(REQUIRED_EXPENSE_SHEET_HEADERS) | set(OPTIONAL_EXPENSE_SHEET_HEADERS) == set(EXPENSE_SHEET_HEADERS)
 
 
 def test_expense_record_to_sheets_row():
-    """Verify ExpenseRecord serializes to the 10 columns of raw_expenses, in order."""
+    """Verify ExpenseRecord serializes to the columns of raw_expenses, in order (optional ones empty)."""
     row = make_record().to_sheets_row()
 
-    assert len(row) == 10
+    assert len(row) == 11
     assert row[1] == "wamid.test_001"      # message_id (idempotency key)
     assert row[2] == "a" * 64              # user_phone_hash (never the phone itself)
     assert row[3] == "2026-10-19"          # fecha_gasto
@@ -51,13 +60,14 @@ def test_expense_record_to_sheets_row():
     assert row[7] == "Taxi"                # subcategoria
     assert row[8] == "Tarjeta de Crédito"  # medio_de_pago
     assert row[9] == "Viaje al aeropuerto" # descripcion
+    assert row[10] == ""                   # reply_message_id: written later, when the bot answers
 
 
 def test_to_sheets_dict_and_row_agree():
     record = make_record()
     values = record.to_sheets_dict()
-    assert list(values) == EXPENSE_SHEET_HEADERS
-    assert record.to_sheets_row() == [values[h] for h in EXPENSE_SHEET_HEADERS]
+    assert list(values) == REQUIRED_EXPENSE_SHEET_HEADERS
+    assert record.to_sheets_row() == [values.get(h, "") for h in EXPENSE_SHEET_HEADERS]
 
 
 def test_sheet_never_contains_the_raw_phone_number():

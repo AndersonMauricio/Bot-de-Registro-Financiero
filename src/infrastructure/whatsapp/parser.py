@@ -17,6 +17,8 @@ class ParsedWhatsAppMessage:
     text_content: Optional[str] = None
     media_base64: Optional[str] = None
     mime_type: Optional[str] = None
+    # Message this one answers (a quoted reply), when the user corrected an expense
+    quoted_message_id: Optional[str] = None
 
 
 class WhatsAppPayloadParser:
@@ -55,6 +57,9 @@ class WhatsAppPayloadParser:
             raw_message = data.get("message") or {}
             message = cls._unwrap(raw_message)
             timestamp = str(data.get("messageTimestamp", ""))
+            # Evolution exposes the quote at data.contextInfo (sibling of `message`); real WhatsApp payloads
+            # carry it inside the content node instead, so both places are checked
+            quoted_id = cls._quoted_message_id(message, data.get("contextInfo"))
 
             # 1. Text Message
             if "conversation" in message or "extendedTextMessage" in message:
@@ -68,6 +73,7 @@ class WhatsAppPayloadParser:
                     timestamp=timestamp,
                     input_type=InputTypeEnum.TEXT,
                     text_content=body,
+                    quoted_message_id=quoted_id,
                 )
 
             # 2. Audio or Voice Note (base64 is inline when the webhook is configured with base64=true)
@@ -80,6 +86,7 @@ class WhatsAppPayloadParser:
                     input_type=InputTypeEnum.AUDIO,
                     media_base64=raw_message.get("base64") or None,
                     mime_type=audio_data.get("mimetype", "audio/ogg"),
+                    quoted_message_id=quoted_id,
                 )
 
             # 3. Image / Ticket
@@ -92,6 +99,7 @@ class WhatsAppPayloadParser:
                     input_type=InputTypeEnum.IMAGE,
                     text_content=(image_data.get("caption") or "").strip(),
                     mime_type=image_data.get("mimetype", "image/jpeg"),
+                    quoted_message_id=quoted_id,
                 )
 
             logger.info(f"Ignored unsupported WhatsApp message type: {data.get('messageType')}")
@@ -127,3 +135,20 @@ class WhatsAppPayloadParser:
             else:
                 return message
         return message
+
+    @staticmethod
+    def _quoted_message_id(message: dict, context_info: Optional[dict] = None) -> Optional[str]:
+        """ID of the message this one replies to (`contextInfo.stanzaId`), or None.
+
+        Evolution delivers `contextInfo` at `data.contextInfo`; the raw WhatsApp payload nests it inside the
+        content node (extendedTextMessage, audioMessage, imageMessage…), so every candidate is inspected.
+        """
+        candidates = [context_info, message.get("contextInfo")]
+        candidates += [value.get("contextInfo") for value in message.values() if isinstance(value, dict)]
+        for context in candidates:
+            if not isinstance(context, dict):
+                continue
+            stanza_id = context.get("stanzaId") or (context.get("quotedMessage") or {}).get("stanzaId")
+            if stanza_id:
+                return str(stanza_id).strip() or None
+        return None

@@ -61,28 +61,89 @@ class EvolutionAPIClient:
     def _http(self, timeout: float) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=timeout, transport=self._transport)
 
-    async def send_text_message(self, recipient_phone: str, text: str) -> bool:
-        """Send a plain text message to a WhatsApp user."""
+    async def send_text_message(
+        self,
+        recipient_phone: str,
+        text: str,
+        quoted_message_id: Optional[str] = None,
+    ) -> bool:
+        """Send a plain text message to a WhatsApp user, optionally answering `quoted_message_id`."""
+        sent, _ = await self._send_text(recipient_phone, text, quoted_message_id)
+        return sent
+
+    async def send_reply(
+        self,
+        recipient_phone: str,
+        text: str,
+        quoted_message_id: str,
+    ) -> Optional[str]:
+        """Send `text` answering `quoted_message_id`; returns the id of the sent message (None on failure).
+
+        The id lets the bot recognize a later correction that quotes this very reply.
+        """
+        _, message_id = await self._send_text(recipient_phone, text, quoted_message_id)
+        return message_id
+
+    async def _send_text(
+        self,
+        recipient_phone: str,
+        text: str,
+        quoted_message_id: Optional[str] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """POST message/sendText. Returns (delivered, id of the created WhatsApp message)."""
         if not self.is_configured:
             logger.warning("Evolution API credentials missing; skipping sending text message.")
-            return False
+            return False, None
 
-        payload = {"number": recipient_phone, "text": text}
+        payload: dict = {"number": recipient_phone, "text": text}
+        if quoted_message_id:
+            payload["quoted"] = {
+                "key": {
+                    "remoteJid": f"{recipient_phone.split('@')[0]}@s.whatsapp.net",
+                    "fromMe": False,
+                    "id": quoted_message_id,
+                }
+            }
 
+        delivered, message_id = await self._post_text(payload, recipient_phone)
+        if not delivered and quoted_message_id:
+            # An older gateway may refuse the quote: delivering the answer matters more than the thread view
+            logger.warning(f"Quoted reply rejected for {mask_phone(recipient_phone)}; retrying without the quote.")
+            delivered, message_id = await self._post_text(
+                {"number": recipient_phone, "text": text}, recipient_phone
+            )
+        return delivered, message_id
+
+    async def _post_text(self, payload: dict, recipient_phone: str) -> tuple[bool, Optional[str]]:
         async with self._http(timeout=15.0) as client:
             try:
                 response = await client.post(self._url("message/sendText"), headers=self.headers, json=payload)
                 response.raise_for_status()
                 logger.info(f"WhatsApp reply sent successfully to {mask_phone(recipient_phone)}.")
-                return True
+                return True, self._sent_message_id(response)
             except httpx.HTTPStatusError as e:
                 logger.error(
                     f"Failed to send WhatsApp message to {mask_phone(recipient_phone)}: HTTP {e.response.status_code}"
                 )
-                return False
+                return False, None
             except httpx.HTTPError as e:
                 logger.error(f"Failed to send WhatsApp message to {mask_phone(recipient_phone)}: {e!r}")
-                return False
+                return False, None
+
+    @staticmethod
+    def _sent_message_id(response: httpx.Response) -> Optional[str]:
+        """Evolution answers with the WhatsApp key of the message it just created."""
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        if not isinstance(body, dict):
+            return None
+        key = body.get("key") or (body.get("data") or {}).get("key") or {}
+        message_id = key.get("id") if isinstance(key, dict) else None
+        if not message_id:
+            return None
+        return str(message_id).strip() or None
 
     async def send_presence(
         self,

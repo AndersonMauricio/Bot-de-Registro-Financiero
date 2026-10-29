@@ -140,3 +140,105 @@ def test_malformed_payloads_return_none(payload):
 def test_is_messages_upsert(event, expected):
     assert WhatsAppPayloadParser.is_messages_upsert({"event": event}) is expected
     assert WhatsAppPayloadParser.is_messages_upsert({}) is False
+
+
+# ------------------------------------------------------- quoted replies (edit mode)
+def test_a_text_reply_keeps_the_id_of_the_quoted_message(make_evolution_payload):
+    """A correction arrives as a reply: `contextInfo.stanzaId` is the message the user answered."""
+    payload = make_evolution_payload(
+        {
+            "extendedTextMessage": {
+                "text": "Me equivoqué, eran 15000",
+                "contextInfo": {
+                    "stanzaId": "BOT-REPLY-1",
+                    "participant": "5491100000000@s.whatsapp.net",
+                },
+            }
+        },
+        message_type="extendedTextMessage",
+    )
+
+    msg = WhatsAppPayloadParser.parse_webhook(payload)
+
+    assert msg is not None
+    assert msg.quoted_message_id == "BOT-REPLY-1"
+
+
+def test_a_voice_note_reply_also_carries_the_quoted_message_id(make_evolution_payload):
+    payload = make_evolution_payload(
+        {
+            "audioMessage": {
+                "mimetype": "audio/ogg; codecs=opus",
+                "contextInfo": {"stanzaId": "BOT-REPLY-2"},
+            }
+        },
+        message_type="audioMessage",
+    )
+
+    msg = WhatsAppPayloadParser.parse_webhook(payload)
+
+    assert msg is not None
+    assert msg.input_type == InputTypeEnum.AUDIO
+    assert msg.quoted_message_id == "BOT-REPLY-2"
+
+
+def test_the_quote_survives_the_ephemeral_wrapper(make_evolution_payload):
+    payload = make_evolution_payload(
+        {
+            "ephemeralMessage": {
+                "message": {
+                    "extendedTextMessage": {
+                        "text": "eran 15000",
+                        "contextInfo": {"stanzaId": "BOT-REPLY-3"},
+                    }
+                }
+            }
+        },
+        message_type="ephemeralMessage",
+    )
+
+    msg = WhatsAppPayloadParser.parse_webhook(payload)
+
+    assert msg is not None
+    assert msg.text_content == "eran 15000"
+    assert msg.quoted_message_id == "BOT-REPLY-3"
+
+
+def test_a_message_that_quotes_nothing_has_no_quoted_id(sample_webhook_text_payload):
+    parsed = WhatsAppPayloadParser.parse_webhook(sample_webhook_text_payload)
+    assert parsed.quoted_message_id is None
+
+
+def test_an_empty_stanza_id_is_treated_as_no_quote(make_evolution_payload):
+    payload = make_evolution_payload(
+        {"extendedTextMessage": {"text": "hola", "contextInfo": {"stanzaId": "   "}}},
+        message_type="extendedTextMessage",
+    )
+
+    assert WhatsAppPayloadParser.parse_webhook(payload).quoted_message_id is None
+
+
+def test_evolution_delivers_the_quote_at_data_level(make_evolution_payload):
+    """Real Evolution v2.3.7 shape: `contextInfo` is a sibling of `message` inside `data`, not inside it."""
+    payload = make_evolution_payload(
+        {"conversation": "corrección, eso último eran en realidad 350"},
+        message_id="3EB0CD0632EEF89514A5CE",
+    )
+    payload["data"]["contextInfo"] = {
+        "participant": "21410495905957@lid",
+        "stanzaId": "3EB0681853B22E12A9A66B",
+        "quotedMessage": {"conversation": "✅ *Gasto Registrado con Éxito*\n\n💰 *Monto:* 160.00 USD"},
+    }
+
+    msg = WhatsAppPayloadParser.parse_webhook(payload)
+
+    assert msg is not None
+    assert msg.text_content == "corrección, eso último eran en realidad 350"
+    assert msg.quoted_message_id == "3EB0681853B22E12A9A66B"
+
+
+def test_a_data_level_context_without_a_stanza_id_is_not_a_quote(make_evolution_payload):
+    payload = make_evolution_payload({"conversation": "gasté 160 usd en una cena"})
+    payload["data"]["contextInfo"] = {"mentionedJid": [], "groupMentions": []}
+
+    assert WhatsAppPayloadParser.parse_webhook(payload).quoted_message_id is None

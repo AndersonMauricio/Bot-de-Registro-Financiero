@@ -70,5 +70,5 @@ def test_data_quality_gate_rejects_low_confidence():
     )
 
     assert result.is_valid is False
-    assert any("Confidence score" in err for err in result.errors)
+    assert any("confianza" in err.lower() for err in result.errors)
     assert result.sanitized_record is None

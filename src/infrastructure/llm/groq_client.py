@@ -8,10 +8,13 @@ from src.core.exceptions import ExtractionError
 from src.core.logging import logger
 from src.domain.models import LLMExtractionResponse, OnboardingData, OnboardingLLMResponse
 from src.infrastructure.llm.prompts import (
+    EDIT_FEW_SHOT_EXAMPLES,
+    EDIT_SYSTEM_PROMPT,
     EXTRACTION_SYSTEM_PROMPT,
     FEW_SHOT_EXAMPLES,
     ONBOARDING_FEW_SHOT_EXAMPLES,
     ONBOARDING_SYSTEM_PROMPT,
+    build_correction_user_prompt,
     build_onboarding_user_prompt,
 )
 
@@ -161,6 +164,39 @@ class GroqLLMClient:
         messages = [
             {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
             *FEW_SHOT_EXAMPLES,
+            {"role": "user", "content": user_prompt},
+        ]
+
+        def parse(parsed_json: dict) -> LLMExtractionResponse:
+            if "metadata" in parsed_json and "raw_text" not in parsed_json["metadata"]:
+                parsed_json["metadata"]["raw_text"] = text
+            return LLMExtractionResponse.model_validate(parsed_json)
+
+        return self._complete_json(messages, parse)
+
+    def correct_expense_entities(
+        self,
+        text: str,
+        original: dict,
+        reference_date: Optional[date] = None,
+        default_currency: str = "ARS",
+    ) -> LLMExtractionResponse:
+        """Correction branch (approved users only): apply a correction to an already registered expense.
+
+        `original` uses the contract's `transaction` keys and must come back untouched except for the
+        fields the message corrects explicitly; the Data Quality Gate validates the result as usual.
+        """
+        ref_date = reference_date or date.today()
+        user_prompt = build_correction_user_prompt(
+            original_json=json.dumps(original, ensure_ascii=False, default=str),
+            reference_date=ref_date,
+            default_currency=str(original.get("currency") or default_currency),
+            text=text,
+        )
+
+        messages = [
+            {"role": "system", "content": EDIT_SYSTEM_PROMPT},
+            *EDIT_FEW_SHOT_EXAMPLES,
             {"role": "user", "content": user_prompt},
         ]
 

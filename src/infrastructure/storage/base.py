@@ -26,6 +26,30 @@ class ExpenseRepositoryInterface(ABC):
         """
         pass
 
+    @abstractmethod
+    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
+        """Return one of this user's own expenses by its incoming message id or the bot reply id.
+
+        Keys: the EXPENSE_SHEET_HEADERS names the storage holds (always message_id, fecha_gasto, monto,
+        moneda, categoria, subcategoria, medio_de_pago and descripcion). None when the id is unknown or
+        belongs to another user.
+        """
+        pass
+
+    @abstractmethod
+    def update_expense(self, record: ExpenseRecord) -> bool:
+        """Overwrite the data columns of the row whose message_id is `record.message_id` (same owner only).
+
+        Never touches the identity columns (message_id, user_phone_hash) nor the ingestion timestamp.
+        Returns False when the row no longer exists.
+        """
+        pass
+
+    @abstractmethod
+    def set_reply_message_id(self, message_id: str, reply_message_id: str, user_phone_hash: str) -> None:
+        """Remember the id of the bot confirmation sent for that expense, so quoting it later resolves the row."""
+        pass
+
 
 class UserRepositoryInterface(ABC):
     """Abstract interface for the users access list (approved / rejected / unknown)."""

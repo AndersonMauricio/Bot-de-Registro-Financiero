@@ -34,6 +34,8 @@ class FakeWhatsApp:
         self.events: list[tuple] = []  # ("typing_start", phone) | ("typing_end", phone) | ("send", phone, text)
         self.media: dict[str, bytes] = {}
         self.downloads: list[str] = []
+        self.quoted_ids: list[Optional[str]] = []  # message answered by each reply, in order
+        self.next_reply_id: Optional[str] = "bot-reply-1"
 
     @property
     def sent(self) -> list[tuple[str, str]]:
@@ -51,9 +53,13 @@ class FakeWhatsApp:
         finally:
             self.events.append(("typing_end", phone))
 
-    async def send_text_message(self, phone: str, text: str) -> bool:
+    async def send_text_message(self, phone: str, text: str, quoted_message_id: Optional[str] = None) -> bool:
+        return bool(await self.send_reply(phone, text, quoted_message_id))
+
+    async def send_reply(self, phone: str, text: str, quoted_message_id: Optional[str]) -> Optional[str]:
         self.events.append(("send", phone, text))
-        return True
+        self.quoted_ids.append(quoted_message_id)
+        return self.next_reply_id
 
     async def download_media(self, message_id: str) -> bytes:
         self.downloads.append(message_id)
@@ -109,8 +115,10 @@ class FakeGroq:
         self.error: Optional[Exception] = None
         self.onboarding_result = OnboardingLLMResponse()
         self.expense_result: Optional[LLMExtractionResponse] = None
+        self.correction_result: Optional[LLMExtractionResponse] = None
         self.onboarding_calls: list[tuple[str, OnboardingData]] = []
         self.expense_calls: list[str] = []
+        self.correction_calls: list[tuple[str, dict]] = []
 
     def collect_onboarding_data(self, text: str, collected: OnboardingData) -> OnboardingLLMResponse:
         self.onboarding_calls.append((text, collected))
@@ -125,6 +133,15 @@ class FakeGroq:
         if self.error:
             raise self.error
         return self.expense_result
+
+    def correct_expense_entities(
+        self, text: str, original: dict, reference_date=None, default_currency: str = "ARS"
+    ):
+        self.correction_calls.append((text, original))
+        time.sleep(self.delay)
+        if self.error:
+            raise self.error
+        return self.correction_result or self.expense_result
 
 
 class FakeWhisper:
@@ -145,7 +162,11 @@ class FakeExpenseRepository(ExpenseRepositoryInterface):
         self.saved = []
         self.processed: set[str] = set()
         self.fail_save = False
+        self.fail_update = False
         self.queried_hashes: list[str] = []
+        self.reply_ids: dict[str, str] = {}  # stored message_id -> id of the bot confirmation
+        self.updated = []
+        self.lookups: list[tuple[str, str]] = []
 
     def save_expense(self, record) -> str:
         if self.fail_save:
@@ -172,6 +193,41 @@ class FakeExpenseRepository(ExpenseRepositoryInterface):
             for r in self.saved
             if r.user_phone_hash == user_phone_hash
         ]
+
+    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
+        self.lookups.append((message_id, user_phone_hash))
+        for record in self.saved:
+            if record.user_phone_hash != user_phone_hash:
+                continue
+            if record.message_id == message_id or self.reply_ids.get(record.message_id) == message_id:
+                return {
+                    "fecha_gasto": record.transaction_date.isoformat(),
+                    "monto": record.amount,
+                    "moneda": record.currency,
+                    "categoria": record.category,
+                    "subcategoria": record.subcategory,
+                    "medio_de_pago": record.payment_method,
+                    "descripcion": record.description,
+                    "message_id": record.message_id,
+                    "reply_message_id": self.reply_ids.get(record.message_id, ""),
+                }
+        return None
+
+    def update_expense(self, record) -> bool:
+        if self.fail_update:
+            raise StorageError("expense sheet down")
+        for index, current in enumerate(self.saved):
+            if current.message_id == record.message_id and current.user_phone_hash == record.user_phone_hash:
+                self.saved[index] = record
+                self.updated.append(record)
+                return True
+        return False
+
+    def set_reply_message_id(self, message_id: str, reply_message_id: str, user_phone_hash: str) -> None:
+        for record in self.saved:
+            if record.message_id == message_id and record.user_phone_hash == user_phone_hash:
+                self.reply_ids[message_id] = reply_message_id
+                return
 
 
 class FakeWorksheet:

@@ -1,7 +1,7 @@
 """PostgreSQL repository implementation for Target Analytics Architecture."""
 
 from typing import Optional
-from sqlalchemy import Column, Date, Float, MetaData, String, Table, Text, Time, create_engine, select
+from sqlalchemy import Column, Date, Float, MetaData, String, Table, Text, Time, create_engine, or_, select, update
 from sqlalchemy.dialects.postgresql import UUID
 from src.core.config import settings
 from src.core.exceptions import StorageError
@@ -29,6 +29,8 @@ expenses_table = Table(
     Column("description", Text, nullable=False),
     Column("confidence_score", Float, nullable=False),
     Column("raw_text", Text, nullable=False),
+    # ID of the bot's confirmation message: lets the user correct this expense by replying to that reply
+    Column("reply_message_id", String(128), nullable=True),
 )
 
 
@@ -100,17 +102,96 @@ class PostgresExpenseRepository(ExpenseRepositoryInterface):
                     .order_by(expenses_table.c.transaction_date, expenses_table.c.transaction_time)
                 )
                 return [
-                    {
-                        "fecha_gasto": row.transaction_date.isoformat(),
-                        "monto": row.amount,
-                        "moneda": row.currency,
-                        "categoria": row.category,
-                        "subcategoria": row.subcategory or "",
-                        "medio_de_pago": row.payment_method,
-                        "descripcion": row.description,
-                    }
+                    self._row_to_dict(row)
                     for row in conn.execute(query)
                 ]
         except Exception as e:
             logger.error(f"Failed to read expenses from PostgreSQL: {e}")
             raise StorageError(f"PostgreSQL read failed: {e}") from e
+
+    @staticmethod
+    def _row_to_dict(row) -> dict:
+        """Row of `raw_whatsapp.expenses` keyed by the report/contract names used everywhere else."""
+        return {
+            "fecha_gasto": row.transaction_date.isoformat(),
+            "monto": row.amount,
+            "moneda": row.currency,
+            "categoria": row.category,
+            "subcategoria": row.subcategory or "",
+            "medio_de_pago": row.payment_method,
+            "descripcion": row.description,
+            "message_id": row.message_id,
+            "reply_message_id": row.reply_message_id or "",
+        }
+
+    def find_expense_by_message_id(self, message_id: str, user_phone_hash: str) -> Optional[dict]:
+        """This user's own expense cited by `message_id`, or None when it does not exist or is not theirs."""
+        if not (message_id and user_phone_hash):
+            return None
+        try:
+            with self.engine.connect() as conn:
+                query = select(expenses_table).where(
+                    or_(
+                        expenses_table.c.message_id == message_id,
+                        expenses_table.c.reply_message_id == message_id,
+                    ),
+                    expenses_table.c.user_phone_hash == user_phone_hash,
+                )
+                row = conn.execute(query).first()
+                return self._row_to_dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to find an expense by message id in PostgreSQL: {e}")
+            raise StorageError(f"PostgreSQL read failed: {e}") from e
+
+    def update_expense(self, record: ExpenseRecord) -> bool:
+        """Overwrite the data columns of the row of `record.message_id`, only if it belongs to that user."""
+        try:
+            with self.engine.begin() as conn:
+                stmt = (
+                    update(expenses_table)
+                    .where(
+                        expenses_table.c.message_id == record.message_id,
+                        expenses_table.c.user_phone_hash == record.user_phone_hash,
+                    )
+                    .values(
+                        transaction_date=record.transaction_date,
+                        transaction_time=record.transaction_time,
+                        amount=record.amount,
+                        currency=record.currency,
+                        category=record.category,
+                        subcategory=record.subcategory,
+                        merchant_name=record.merchant_name,
+                        payment_method=record.payment_method,
+                        description=record.description,
+                        confidence_score=record.confidence_score,
+                        raw_text=record.raw_text,
+                    )
+                )
+                updated = conn.execute(stmt).rowcount > 0
+            if not updated:
+                logger.warning(f"Expense {record.message_id} is no longer in PostgreSQL; nothing was updated.")
+            else:
+                logger.info(f"Expense {record.message_id} updated in PostgreSQL.")
+            return updated
+        except Exception as e:
+            logger.error(f"Failed to update an expense in PostgreSQL: {e}")
+            raise StorageError(f"PostgreSQL update failed: {e}") from e
+
+    def set_reply_message_id(self, message_id: str, reply_message_id: str, user_phone_hash: str) -> None:
+        """Remember the bot confirmation id of an expense. Best effort: the user was already answered."""
+        if not (message_id and reply_message_id):
+            return
+        try:
+            with self.engine.begin() as conn:
+                stmt = (
+                    update(expenses_table)
+                    .where(
+                        expenses_table.c.message_id == message_id,
+                        expenses_table.c.user_phone_hash == user_phone_hash,
+                    )
+                    .values(reply_message_id=reply_message_id)
+                )
+                conn.execute(stmt)
+        except Exception as e:
+            # Losing the link only degrades later corrections: never fail the answer that is already sent
+            logger.warning(f"Could not store the reply id of expense {message_id}: {e}")

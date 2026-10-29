@@ -12,13 +12,16 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 | 4 | Trazabilidad PII (`user_phone_hash` en cada fila) | ✅ | Nada |
 | 5 | Data Serving: reportes por demanda en Drive | ✅ (probado con dobles, **no contra Google real**) | Habilitar la Drive API del proyecto de GCP; opcional `REPORTS_FOLDER_ID` |
 | 6 | Esquema de las pestañas `raw_expenses` y `usuarios` | ✅ | Reemplazar los encabezados de `raw_expenses` por los nuevos: [sheets_schema.md](sheets_schema.md) |
+| 7 | Edición y corrección de registros (update por cita) | ✅ | Agregar la columna `reply_message_id` a `raw_expenses` (o `ALTER TABLE` en PostgreSQL): [sheets_schema.md](sheets_schema.md) |
 
 ### Decisiones de implementación
 
 - **Punto 1 – "eliminar solo ese registro":** el bot guarda la lista completa en una sola lectura, así que borrar un registro lo haría pasar por "desconocido". En su lugar marca ese número como vencido: su próxima consulta relee la hoja **una vez** (y de paso refresca al resto). Si esa relectura falla, **cierra el acceso** en vez de usar el dato viejo. El secreto es distinto al de Evolution.
 - **Punto 3:** los enums aceptan variaciones de mayúsculas y tildes (`ALIMENTACION` → `Alimentación`) pero rechazan cualquier valor fuera de la taxonomía; los valores en inglés anteriores (`CASH`, `CREDIT_CARD`…) ya no son válidos. Un test verifica que enums, prompt y `data_contract.json` listen lo mismo.
 - **Punto 5 – intercepción:** se hace en el pipeline de gastos **después** de obtener el texto (o la transcripción), para que *"quiero mi resumen"* dicho por audio no se registre como gasto. La detección es determinista (sin LLM): un pedido de reporte nunca lleva un monto.
-- **Punto 6:** `Fecha_Registro` se genera cuando el bot ve el número por primera vez, y desaparece `fecha_actualizacion`. Las pestañas con los nombres de la versión anterior (`nombre_completo`, `fecha_alta`) siguen funcionando. `raw_expenses` se escribe por nombre de columna y, si falta alguna de las 10, el bot se niega a guardar en vez de desalinear datos. La idempotencia por `message_id` ahora sobrevive a reinicios.
+- **Punto 6:** `Fecha_Registro` se genera cuando el bot ve el número por primera vez, y desaparece `fecha_actualizacion`. Las pestañas con los nombres de la versión anterior (`nombre_completo`, `fecha_alta`) siguen funcionando. `raw_expenses` se escribe por nombre de columna y, si falta alguna de las 10 obligatorias, el bot se niega a guardar en vez de desalinear datos. La idempotencia por `message_id` ahora sobrevive a reinicios.
+- **Punto 7 – "update por cita":** la fila se identifica por `message_id` **o** por `reply_message_id` (el ID de la confirmación que envía el bot, capturado de la respuesta de `message/sendText`), siempre filtrada por `user_phone_hash`: no existe forma de editar un gasto ajeno aunque se conozca el ID. El `UPDATE` sobrescribe solo las 7 columnas de datos; `message_id`, `timestamp` y el hash no se tocan. Una cita que no resuelve **no** se registra como gasto nuevo: el bot pide aclaración.
+- **Punto 7 – corrección sin cita:** una frase como *"me equivoqué, eran 155"* se detecta con una regla determinista (`edit_intent.py`, sin LLM) y se responde pidiendo que cite el mensaje: antes caía en la extracción normal y devolvía un error técnico de confianza. Además, la moneda y la fecha solo cambian si el mensaje las menciona explícitamente (guarda en el servicio, independiente del LLM).
 
 ### Riesgos a tener presentes
 
@@ -26,6 +29,10 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 - **El email no está verificado:** el reporte se comparte con la dirección que la persona escribió en el onboarding. Quien apruebe usuarios debería confirmar que pertenece a esa persona.
 - **Cada reporte es un archivo nuevo en Drive** de la cuenta de servicio; se limita con un enfriamiento por usuario (`REPORT_COOLDOWN_SECONDS`), pero no se borran los viejos.
 - **Registro al primer contacto:** cualquier número que escriba queda registrado en `usuarios` (una escritura en la hoja). No hay límite por número desconocido.
+- **Las correcciones no se auditan:** la fila guarda solo el valor final. El "antes → después" queda en el mensaje de WhatsApp, no en la base. Si se necesita trazabilidad, el paso siguiente es una tabla de auditoría (`expense_versions`) o guardar `editado_en`/`editado_por`.
+- **La edición no tiene ventana temporal:** el usuario puede reescribir un gasto de hace meses. Se decidió así para el MVP; un límite (por ejemplo 30 días) es una línea de configuración.
+- **Citar la confirmación del bot depende de una columna nueva:** en una hoja sin `reply_message_id` solo se pueden corregir los gastos respondiendo al mensaje propio del usuario. La degradación es silenciosa (un warning en el log), nunca rompe el registro.
+- **Se recuerda una sola confirmación por gasto:** `reply_message_id` se sobrescribe en cada corrección, así que citar una confirmación anterior no resuelve. Guardar un historial de IDs exigiría otra tabla (o un valor multi-valor), que se dejó fuera del MVP.
 
 ---
 
@@ -82,3 +89,14 @@ Estructura obligatoria para gestionar los accesos:
 3. `Email`: Correo del cliente para otorgar permisos de lectura al reporte de Drive.
 4. `Estado`: Variable de control (1 = Aprobado, 2 = Rechazado, Vacío = Pendiente).
 5. `Fecha_Registro`: Timestamp generado por el backend al detectar el nuevo número.
+
+
+## 7. Edición y Corrección de Registros (Update Mode por Cita)
+**Objetivo:** Permitir corregir errores de tipeo o montos incorrectos en gastos ya registrados, sin duplicar filas ni ensuciar la base.
+
+* **Detección en el Webhook:** Evolution envía el ID del mensaje citado en `contextInfo.stanzaId`. El parser lo expone como `quoted_message_id` y el pipeline de gastos entra en modo corrección en lugar de insertar.
+* **Lógica de actualización:**
+  1. Se busca la fila original por `message_id` o `reply_message_id`, **siempre** acotada al `user_phone_hash` del remitente (en Sheets se resuelve la fila A1 y se actualiza con `spreadsheets.values.batchUpdate`; en PostgreSQL, `UPDATE ... WHERE message_id = :id AND user_phone_hash = :hash`).
+  2. El LLM recibe el registro original y el mensaje de corrección (`EDIT_SYSTEM_PROMPT`), devolviendo el mismo contrato JSON con solo los campos corregidos.
+  3. La validación es la misma del alta (Data Quality Gate) y se sobrescriben únicamente las columnas de datos; la identidad de la fila (`message_id`, `user_phone_hash`) y el `timestamp` de ingesta quedan intactos.
+* **Trazabilidad del hilo:** el bot responde citando el mensaje del usuario y guarda el ID de su propia respuesta en `reply_message_id`, de modo que la siguiente corrección puede citar esa confirmación.

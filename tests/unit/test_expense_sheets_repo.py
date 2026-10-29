@@ -270,3 +270,102 @@ def test_a_failing_sheet_raises_a_storage_error():
 
     with pytest.raises(StorageError):
         repo.get_expenses_by_user(HASH_A)
+
+
+# ------------------------------------------------- correction by citation (update mode)
+def sheet_with_expense(**overrides):
+    ws = empty_sheet()
+    repo = repo_for(ws)
+    repo.save_expense(record("msg-1", amount=1500.0, description="Café", **overrides))
+    return ws, repo
+
+
+def test_a_cited_message_is_found_for_its_owner():
+    _, repo = sheet_with_expense()
+
+    found = repo.find_expense_by_message_id("msg-1", HASH_A)
+
+    assert found["message_id"] == "msg-1"
+    assert found["monto"] == 1500.0
+    assert found["descripcion"] == "Café"
+
+
+def test_a_citation_of_another_users_expense_is_never_found():
+    _, repo = sheet_with_expense()
+
+    assert repo.find_expense_by_message_id("msg-1", HASH_B) is None
+
+
+def test_the_bot_confirmation_id_also_resolves_the_row():
+    ws, repo = sheet_with_expense()
+
+    repo.set_reply_message_id("msg-1", "BOT-REPLY-1", HASH_A)
+
+    found = repo.find_expense_by_message_id("BOT-REPLY-1", HASH_A)
+    assert found["message_id"] == "msg-1"
+    stored = dict(zip(EXPENSE_SHEET_HEADERS, ws.rows[1]))
+    assert str(stored["reply_message_id"]).lstrip("'") == "BOT-REPLY-1"
+
+
+def test_storing_the_reply_id_writes_a_single_cell():
+    ws, repo = sheet_with_expense()
+
+    repo.set_reply_message_id("msg-1", "BOT-REPLY-1", HASH_A)
+
+    assert ws.batch_updates == [[{"range": "K2", "values": [["'BOT-REPLY-1"]]}]]
+
+
+def test_an_unknown_citation_is_not_found():
+    _, repo = sheet_with_expense()
+
+    assert repo.find_expense_by_message_id("nope", HASH_A) is None
+
+
+@pytest.mark.parametrize("message_id, user_hash", [("", HASH_A), (None, HASH_A), ("msg-1", ""), ("msg-1", None)])
+def test_an_empty_citation_or_hash_does_not_even_read_the_sheet(message_id, user_hash):
+    ws, repo = sheet_with_expense()
+    reads = ws.reads
+
+    assert repo.find_expense_by_message_id(message_id, user_hash) is None
+    assert ws.reads == reads
+
+
+def test_a_correction_rewrites_only_the_data_columns():
+    ws, repo = sheet_with_expense()
+    before = dict(zip(EXPENSE_SHEET_HEADERS, ws.rows[1]))
+
+    assert repo.update_expense(record("msg-1", amount=15000.0, description="Café con amigos")) is True
+
+    after = dict(zip(EXPENSE_SHEET_HEADERS, ws.rows[1]))
+    assert after["monto"] == 15000.0
+    assert after["descripcion"] == "Café con amigos"
+    for untouched in ("timestamp", "message_id", "user_phone_hash", "fecha_gasto", "moneda", "categoria"):
+        assert after[untouched] == before[untouched]
+
+
+def test_a_correction_never_touches_another_users_row():
+    ws, repo = sheet_with_expense()
+
+    assert repo.update_expense(record("msg-1", user_hash=HASH_B, amount=1.0)) is False
+
+    assert dict(zip(EXPENSE_SHEET_HEADERS, ws.rows[1]))["monto"] == 1500.0
+
+
+def test_a_correction_of_a_missing_row_reports_failure():
+    _, repo = sheet_with_expense()
+
+    assert repo.update_expense(record("msg-404")) is False
+
+
+def test_an_older_sheet_without_the_reply_column_still_corrects_the_users_own_message():
+    header = [h for h in EXPENSE_SHEET_HEADERS if h != "reply_message_id"]
+    ws = FakeWorksheet([header])
+    repo = repo_for(ws)
+    repo.save_expense(record("msg-1", amount=1500.0))
+
+    repo.set_reply_message_id("msg-1", "BOT-REPLY-1", HASH_A)  # no column: silently ignored
+
+    assert repo.find_expense_by_message_id("msg-1", HASH_A)["monto"] == 1500.0
+    assert repo.find_expense_by_message_id("BOT-REPLY-1", HASH_A) is None
+    assert repo.update_expense(record("msg-1", amount=15000.0)) is True
+    assert dict(zip(header, ws.rows[1]))["monto"] == 15000.0

@@ -23,7 +23,26 @@ EXPENSE_SHEET_HEADERS = [
     "subcategoria",
     "medio_de_pago",
     "descripcion",
+    # ID of the bot's confirmation message: lets a user correct the expense by replying to that reply
+    "reply_message_id",
 ]
+
+# Without `reply_message_id` older worksheets keep working (only quoting the user's own message resolves)
+OPTIONAL_EXPENSE_SHEET_HEADERS = ("reply_message_id",)
+REQUIRED_EXPENSE_SHEET_HEADERS = [
+    header for header in EXPENSE_SHEET_HEADERS if header not in OPTIONAL_EXPENSE_SHEET_HEADERS
+]
+
+# Columns an edit may overwrite (identity and ingestion metadata are never rewritten)
+EXPENSE_DATA_COLUMNS = (
+    "fecha_gasto",
+    "monto",
+    "moneda",
+    "categoria",
+    "subcategoria",
+    "medio_de_pago",
+    "descripcion",
+)
 
 
 class ExtractionMetadata(BaseModel):
@@ -124,9 +143,9 @@ class ExpenseRecord(BaseModel):
         }
 
     def to_sheets_row(self) -> list:
-        """Values as an ordered list matching EXPENSE_SHEET_HEADERS."""
+        """Values as an ordered list matching EXPENSE_SHEET_HEADERS (optional columns stay empty)."""
         values = self.to_sheets_dict()
-        return [values[header] for header in EXPENSE_SHEET_HEADERS]
+        return [values.get(header, "") for header in EXPENSE_SHEET_HEADERS]
 
 
 class DataQualityResult(BaseModel):

@@ -49,23 +49,24 @@ class DataQualityGate:
         # 1. Confidence Score Check
         if meta.confidence_score < cls.MIN_CONFIDENCE_THRESHOLD:
             errors.append(
-                f"Confidence score ({meta.confidence_score:.2f}) is below minimum acceptable threshold ({cls.MIN_CONFIDENCE_THRESHOLD:.2f})"
+                f"La confianza de la extracción ({meta.confidence_score:.2f}) es menor al mínimo aceptable "
+                f"({cls.MIN_CONFIDENCE_THRESHOLD:.2f})."
             )
 
         # 2. Amount Validation
         if tx.amount <= 0:
-            errors.append(f"Invalid transaction amount: {tx.amount}. Amount must be strictly positive.")
+            errors.append(f"El monto ({tx.amount}) debe ser un número mayor a 0.")
 
         # 3. Currency Validation
         currency_clean = tx.currency.upper().strip()
         if not cls.VALID_CURRENCY_REGEX.match(currency_clean):
-            errors.append(f"Currency code '{tx.currency}' must follow ISO 4217 (3 uppercase letters).")
+            errors.append(f"La moneda '{tx.currency}' debe ser un código ISO 4217 de 3 letras mayúsculas.")
 
         # 4. Future Date Check (Warning, not blocking)
         today = date.today()
         if tx.transaction_date > today:
             warnings.append(
-                f"Transaction date {tx.transaction_date.isoformat()} is in the future. Today is {today.isoformat()}."
+                f"La fecha del gasto ({tx.transaction_date.isoformat()}) es futura; hoy es {today.isoformat()}."
             )
 
         # If errors encountered, return invalid result

@@ -57,9 +57,9 @@ flowchart LR
      printf 'Telefono\tNombre\tEmail\tEstado\tFecha_Registro\n' | pbcopy
      ```
      Si la pestaña no existe, el bot no puede verificar a nadie y rechaza todos los mensajes.
-   - La pestaña de gastos (`raw_expenses` por defecto) tiene que existir. Si está vacía, el bot crea sus 10 encabezados; si ya tiene otra estructura (por ejemplo la de la versión anterior), **reemplazala** por la de [sheets_schema.md](sheets_schema.md#pestaña-raw_expenses-registro-de-gastos), porque si falta alguna columna el bot se niega a guardar. En macOS:
+   - La pestaña de gastos (`raw_expenses` por defecto) tiene que existir. Si está vacía, el bot crea sus encabezados; si ya tiene otra estructura, **reemplazala** por la de [sheets_schema.md](sheets_schema.md#pestaña-raw_expenses-registro-de-gastos), porque si falta alguna de las 10 columnas obligatorias el bot se niega a guardar. La 11ª (`reply_message_id`) es opcional: sin ella no se pueden corregir gastos citando la confirmación del bot. En macOS:
      ```bash
-     printf 'timestamp\tmessage_id\tuser_phone_hash\tfecha_gasto\tmonto\tmoneda\tcategoria\tsubcategoria\tmedio_de_pago\tdescripcion\n' | pbcopy
+     printf 'timestamp\tmessage_id\tuser_phone_hash\tfecha_gasto\tmonto\tmoneda\tcategoria\tsubcategoria\tmedio_de_pago\tdescripcion\treply_message_id\n' | pbcopy
      ```
    - Para los **reportes** habilitá la **Google Drive API** en el proyecto de GCP de la cuenta de servicio (y, opcionalmente, `REPORTS_FOLDER_ID` en el `.env`).
 
@@ -182,10 +182,11 @@ Mirá la terminal del bot y, **desde el segundo teléfono**, escribile al númer
 1. **`hola`** → el bot te pide nombre y apellido, después el email, y cierra avisando que la cuenta **requiere aprobación manual del administrador**.
 2. En la pestaña `usuarios` aparece tu fila con `estado` vacío. Cargá **`1`** (aprobado).
 3. Esperá hasta **60 segundos** (el bot cachea la lista de usuarios) y mandá *"Gasté 15 USD en almuerzo con débito"* → responde "✅ Gasto Registrado con Éxito" y aparece una fila en `raw_expenses`.
-4. Mandá una **nota de voz** con un gasto: se transcribe con Whisper y se registra igual.
-5. Cambiá `estado` a **`2`** (rechazado), esperá la caché y escribí de nuevo → responde "⛔ Acceso denegado".
+4. **Corregí ese gasto**: respondé (citando) el mensaje de confirmación del bot con *"me equivoqué, eran 150 USD"* → responde "✏️ Registro modificado" y la fila se actualiza **en el lugar** (no aparece una fila nueva). Requiere la columna `reply_message_id` en la hoja.
+5. Mandá una **nota de voz** con un gasto: se transcribe con Whisper y se registra igual.
+6. Cambiá `estado` a **`2`** (rechazado), esperá la caché y escribí de nuevo → responde "⛔ Acceso denegado".
 
-6. Pedí tu **reporte** escribiendo *"quiero mi resumen"* (o por audio): el bot responde con el link a un Google Spreadsheet con **solo tus gastos**, compartido en solo lectura con el email que dejaste en el onboarding. Hay un enfriamiento de 5 minutos entre reportes.
+7. Pedí tu **reporte** escribiendo *"quiero mi resumen"* (o por audio): el bot responde con el link a un Google Spreadsheet con **solo tus gastos**, compartido en solo lectura con el email que dejaste en el onboarding. Hay un enfriamiento de 5 minutos entre reportes.
 
 Mientras Groq procesa, el chat muestra "escribiendo…".
 

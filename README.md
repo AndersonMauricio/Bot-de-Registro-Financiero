@@ -110,7 +110,7 @@ bot-wpp/
 │   │   └── data_quality.py        # Data Quality Gate
 │   └── infrastructure/
 │       ├── whatsapp/              # Cliente y parser de Evolution API
-│       ├── llm/                   # Cliente de Groq y prompts (onboarding / extracción)
+│       ├── llm/                   # Cliente de Groq y prompts (onboarding / extracción / corrección)
 │       ├── audio/                 # Transcripción con Groq Whisper
 │       ├── cache/                 # Caché TTL en memoria
 │       └── storage/               # Repositorios: Sheets (gastos, usuarios, reportes) y PostgreSQL
@@ -190,6 +190,30 @@ El onboarding tiene su propio contrato, definido en `ONBOARDING_SYSTEM_PROMPT`: 
 
 ---
 
+## ✏️ Edición y Corrección de Registros
+
+Un usuario aprobado corrige un gasto **respondiendo (citando) el mensaje de confirmación del bot**. No se crea una fila nueva: se actualiza la existente.
+
+```text
+Usuario: Gasté 1500 en café.
+Bot:     ✅ Gasto Registrado… (respuesta citada al mensaje del usuario)
+
+Usuario: (cita el mensaje del bot) Me equivoqué, eran 15000.
+Bot:     ✏️ Registro modificado · Monto: 15,000.00 ARS (antes 1,500.00 ARS) …
+```
+
+- **Detección:** Evolution manda el ID citado en `contextInfo.stanzaId`, **al nivel de `data`** (hermano de `message`); WhatsApp en crudo lo anida dentro del contenido. El parser revisa ambos lugares, lo expone como `quoted_message_id` y el bot entra en modo edición.
+- **Resolución de la fila:** se busca por `message_id` **o** `reply_message_id` (el ID de la confirmación del bot, que se guarda al responder) y **siempre** con el `user_phone_hash` del remitente: una cita a un gasto ajeno no se encuentra.
+- **Corrección:** el LLM recibe el registro actual + el mensaje del usuario (`EDIT_SYSTEM_PROMPT`) y devuelve el contrato JSON completo cambiando **solo** los campos corregidos. La validación es la misma del alta (Data Quality Gate).
+- **Persistencia:** se sobrescriben únicamente las columnas de datos. `message_id` (idempotencia), `timestamp` (ingesta) y `user_phone_hash` quedan intactos.
+- **Cita no reconocida:** el bot pide que aclare y **no** registra nada, para no ensuciar la base con filas inventadas.
+- **Corrección sin cita:** si el usuario escribe *"me equivoqué, eran 155"* sin responder a un mensaje, el bot lo detecta (regla determinista, sin LLM), **no registra nada** y le pide que cite la confirmación. Antes ese mensaje terminaba en un error técnico de validación.
+- **Solo cambia lo que el usuario menciona:** si la corrección no dice la moneda ni la fecha, se conservan las del registro (un *"eran 155"* sobre un gasto de 15 USD queda en 155 USD, nunca pasa a ARS por el valor por defecto).
+- **Última confirmación:** se recuerda solo el ID de la última respuesta del bot para cada gasto, así que las correcciones en cadena se hacen citando esa.
+- **Sin límite de antigüedad:** se puede corregir cualquier gasto propio. No hay historial de versiones (el "antes → después" queda en el mensaje de WhatsApp).
+
+---
+
 ## 📊 Esquema de Datos
 
 ### Google Sheets (MVP)
@@ -208,6 +232,7 @@ El onboarding tiene su propio contrato, definido en `ONBOARDING_SYSTEM_PROMPT`: 
 | `subcategoria` | Detalle granular extraído por el LLM | `Supermercado` |
 | `medio_de_pago` | Medio de pago en español (ver arriba) | `Tarjeta de Débito` |
 | `descripcion` | Detalle del gasto | `Almuerzo de trabajo` |
+| `reply_message_id` | **Opcional.** ID de la confirmación que envió el bot: permite corregir el gasto respondiendo a ese mensaje | `3EB0A1B2C3D4E5F60009` |
 
 **Pestaña `usuarios`** (`Telefono`, `Nombre`, `Email`, `Estado`, `Fecha_Registro`): control de acceso, documentada junto con la anterior en [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-usuarios-control-de-acceso).
 
@@ -232,8 +257,9 @@ Tabla `raw_whatsapp.expenses`, definida en [postgres_repo.py](src/infrastructure
 | `description` | `TEXT` | Detalle o concepto del gasto |
 | `confidence_score` | `FLOAT` | Puntuación de certeza de la extracción (0.00 - 1.00) |
 | `raw_text` | `TEXT` | Texto original / transcripción para auditoría |
+| `reply_message_id` | `VARCHAR(128)` (nulo) | ID de la confirmación del bot, para corregir el gasto citándola |
 
-> El esquema `raw_whatsapp` y la tabla `expenses` todavía no se crean automáticamente (no hay migraciones): creálos antes de usar `STORAGE_BACKEND=postgres`.
+> El esquema `raw_whatsapp` y la tabla `expenses` todavía no se crean automáticamente (no hay migraciones): creálos antes de usar `STORAGE_BACKEND=postgres`. Si la tabla ya existía sin la función de edición, agregá la columna con `ALTER TABLE raw_whatsapp.expenses ADD COLUMN reply_message_id VARCHAR(128);`.
 
 ---
 
@@ -337,7 +363,7 @@ python scripts/test_sheets_write.py # escribe una fila de prueba en la hoja de g
 ## 👥 Contribución y Buenas Prácticas
 
 1. Todos los cambios en prompts de extracción deben mantener compatibilidad con [`docs/data_contract.json`](docs/data_contract.json).
-2. Los prompts de onboarding (`ONBOARDING_*`) y de extracción (`EXTRACTION_*`) están aislados en [prompts.py](src/infrastructure/llm/prompts.py): no mezcles ejemplos entre ramas.
+2. Los prompts de onboarding (`ONBOARDING_*`), de extracción (`EXTRACTION_*`) y de corrección (`EDIT_*`) están aislados en [prompts.py](src/infrastructure/llm/prompts.py): no mezcles ejemplos entre ramas.
 3. No modifiques los nombres de columnas de las hojas sin actualizar el mapeo en el código: `EXPENSE_SHEET_HEADERS` y `ExpenseRecord.to_sheets_dict()` en [models.py](src/domain/models.py) (gastos) y `HEADERS` en [sheets_users_repo.py](src/infrastructure/storage/sheets_users_repo.py) (usuarios), además de [docs/sheets_schema.md](docs/sheets_schema.md) y del [Apps Script](apps_script/usuarios_onedit.gs).
 4. Para sugerencias de nuevas categorías o métricas, abrí un *Issue* describiendo la justificación analítica. Una categoría nueva también debe agregarse a `CategoryEnum`, al prompt de extracción y a `docs/data_contract.json` (un test verifica que los tres coincidan).
 5. Corré `pytest` antes de integrar cambios y usá siempre datos ficticios (números, nombres y emails) en tests, ejemplos y documentación.

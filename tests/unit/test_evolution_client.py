@@ -197,3 +197,52 @@ async def test_decode_base64_media_accepts_data_uris_and_rejects_empty_content()
     assert decode_base64_media("data:audio/ogg;base64," + base64.b64encode(b"abc").decode()) == b"abc"
     with pytest.raises(WhatsAppClientError):
         decode_base64_media("")
+
+
+# ------------------------------------------------------------- quoted replies
+async def test_a_quoted_reply_carries_the_key_of_the_answered_message():
+    gateway = Gateway(body={"key": {"remoteJid": f"{PHONE}@s.whatsapp.net", "fromMe": True, "id": "BOT-MSG-1"}})
+
+    sent_id = await make_client(gateway).send_reply(PHONE, "✏️ Registro modificado", "USER-MSG-1")
+
+    assert sent_id == "BOT-MSG-1"
+    assert gateway.json() == {
+        "number": PHONE,
+        "text": "✏️ Registro modificado",
+        "quoted": {"key": {"remoteJid": f"{PHONE}@s.whatsapp.net", "fromMe": False, "id": "USER-MSG-1"}},
+    }
+
+
+async def test_a_reply_without_a_reported_id_returns_none():
+    gateway = Gateway(body={"ok": True})
+
+    assert await make_client(gateway).send_reply(PHONE, "hola", "USER-MSG-1") is None
+    assert gateway.json()["quoted"]["key"]["id"] == "USER-MSG-1"
+
+
+async def test_a_gateway_that_rejects_the_quote_still_delivers_the_message():
+    payloads: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        if len(payloads) == 1:
+            return httpx.Response(400, json={"message": "invalid quoted message"})
+        return httpx.Response(200, json={"key": {"id": "BOT-MSG-2"}})
+
+    client = EvolutionAPIClient(
+        base_url="http://evolution.test/",
+        api_key="test-api-key",
+        instance="my-instance",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert await client.send_reply(PHONE, "hola", "USER-MSG-1") == "BOT-MSG-2"
+    assert "quoted" in payloads[0]
+    assert payloads[1] == {"number": PHONE, "text": "hola"}
+
+
+async def test_send_text_message_still_answers_true_or_false():
+    gateway = Gateway(body={"key": {"id": "BOT-MSG-3"}})
+
+    assert await make_client(gateway).send_text_message(PHONE, "hola") is True
+    assert gateway.json() == {"number": PHONE, "text": "hola"}
