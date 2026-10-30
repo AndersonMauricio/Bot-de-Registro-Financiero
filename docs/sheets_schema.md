@@ -128,7 +128,7 @@ Reglas y límites:
 
 ## Reportes por demanda
 
-Un usuario aprobado que pide *"quiero mi resumen"* (por texto o por audio) recibe por WhatsApp el link a un Google Spreadsheet **nuevo** con sus gastos:
+Un usuario aprobado que pide su resumen (*"quiero mi resumen"*, *"mis gastos"*, *"¿cuánto gasté?"*…) por texto o por audio recibe por WhatsApp el link a un Google Spreadsheet **nuevo** con sus gastos:
 
 1. El bot filtra `raw_expenses` por el `user_phone_hash` del remitente (nunca por otro dato: aislamiento estricto).
 2. La cuenta de servicio crea el spreadsheet (en la carpeta `REPORTS_FOLDER_ID` si está configurada) y lo comparte en **solo lectura** con el `Email` registrado en `usuarios`.

@@ -14,11 +14,21 @@ from src.domain.models import (
     LLMExtractionResponse,
 )
 
+# Shown when nothing in the message looks like an expense (greeting, general question, no amount): it explains what
+# the bot is for instead of reporting a server error
+NO_EXPENSE_DETECTED_MESSAGE = (
+    "No detecté ningún monto o gasto en tu mensaje. Recordá que solo puedo registrar transacciones "
+    "financieras o generar tu resumen de gastos."
+)
+
 
 class DataQualityGate:
     """Enforces data contracts, privacy compliance, and integrity rules."""
 
     MIN_CONFIDENCE_THRESHOLD: float = 0.65
+    # Below this the model itself is saying the message is not an expense; between this and the minimum above it
+    # is a real but unclear expense, and the user is asked to clarify amount and concept
+    OUT_OF_DOMAIN_CONFIDENCE_THRESHOLD: float = 0.30
     VALID_CURRENCY_REGEX = re.compile(r"^[A-Z]{3}$")
     FORMULA_INJECTION_PREFIXES = ("=", "+", "-", "@")
 
@@ -72,6 +82,7 @@ class DataQualityGate:
                     is_valid=False,
                     confidence_score=meta.confidence_score,
                     errors=["No se detectó ningún gasto en el mensaje."],
+                    no_expense_detected=True,
                 )
             ]
 
@@ -117,8 +128,11 @@ class DataQualityGate:
                 f"({cls.MIN_CONFIDENCE_THRESHOLD:.2f})."
             )
 
-        # 2. Amount Validation
-        if tx.amount <= 0:
+        # 2. Amount Validation (a missing amount is the clearest sign that the message is not an expense)
+        missing_amount = tx.amount is None or tx.amount <= 0
+        if tx.amount is None:
+            errors.append("Falta el monto del gasto.")
+        elif tx.amount <= 0:
             errors.append(f"El monto ({tx.amount}) debe ser un número mayor a 0.")
 
         # 3. Currency Validation
@@ -145,6 +159,9 @@ class DataQualityGate:
                 errors=errors,
                 warnings=warnings,
                 sanitized_record=None,
+                no_expense_detected=(
+                    missing_amount or meta.confidence_score < cls.OUT_OF_DOMAIN_CONFIDENCE_THRESHOLD
+                ),
             )
 
         # Build sanitized persistent entity

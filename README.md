@@ -5,7 +5,7 @@
 [![Target Architecture](https://img.shields.io/badge/Target-PostgreSQL%20%7C%20Airflow%20%7C%20dbt%20%7C%20Superset-orange.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)]()
 
-Sistema inteligente de captura y análisis de gastos personales y corporativos vía WhatsApp. Los usuarios aprobados registran gastos enviando **mensajes de texto, notas de voz o fotos de tickets con una descripción** (la lectura automática de la imagen, OCR, todavía no está implementada); un LLM extrae la información estructurada y la centraliza para analítica financiera.
+Sistema inteligente de captura y análisis de gastos personales y corporativos vía WhatsApp. Los usuarios aprobados registran gastos enviando **mensajes de texto, notas de voz o fotos de tickets con una descripción** (la lectura automática de la imagen, OCR, todavía no está implementada); un LLM extrae la información estructurada y la centraliza para analítica financiera. Un mismo mensaje puede describir **varios gastos**, cada usuario puede **corregir** un gasto ya registrado citando la confirmación del bot y puede pedir **su resumen** en un Spreadsheet de solo lectura.
 
 ---
 
@@ -29,7 +29,7 @@ flowchart TD
     subgraph Access["2. Control de acceso (pestaña usuarios en Google Sheets)"]
         API --> ROUTER{"Estado del número (caché en memoria)"}
         ROUTER -->|"2 Rechazado"| DENY["Mensaje de acceso denegado"]
-        ROUTER -->|"Vacío / nuevo"| ONB["Onboarding con ONBOARDING_SYSTEM_PROMPT"]
+        ROUTER -->|"Vacío / nuevo"| ONB["Onboarding: el LLM extrae nombre y email, una FSM responde con texto fijo"]
         ONB --> PEND["Registra el número al primer contacto, guarda nombre y email y avisa que requiere aprobación manual"]
         ROUTER -->|"1 Aprobado"| INPUT{"Tipo de entrada"}
         ADMIN["Administrador edita Estado"] --> USERS[("Google Sheets: usuarios")]
@@ -42,24 +42,32 @@ flowchart TD
         INPUT -->|"Audio"| WHISPER["Groq Whisper"]
         INPUT -->|"Texto / imagen con descripción"| INTENT{"¿Pide su reporte?"}
         WHISPER --> INTENT
-        INTENT -->|"No"| LLM["Groq LLM con EXTRACTION_SYSTEM_PROMPT"]
         INTENT -->|"Sí: quiero mi resumen"| REPORT["Filtra por user_phone_hash, crea un Spreadsheet y lo comparte en solo lectura con su email"]
-        LLM --> DQ{"Data Quality Gate"}
+        INTENT -->|"No"| EDIT{"¿Corrige un gasto ya registrado?"}
+        EDIT -->|"Cita la confirmación o elige de la lista numerada"| CORRECT["Busca la fila por message_id o reply_message_id + user_phone_hash y cambia solo los campos corregidos"]
+        EDIT -->|"Corrección sin cita"| ASKQ["Pide citar la confirmación del bot"]
+        EDIT -->|"No: gasto nuevo"| LLM["Groq LLM con EXTRACTION_SYSTEM_PROMPT (uno o varios gastos)"]
+        LLM --> DQ{"Data Quality Gate (por gasto)"}
         DQ -->|"Falla / duda"| ASK["Pide aclarar monto y concepto"]
+        DQ -->|"Sin monto o confianza muy baja"| SCOPE["Explica qué puede hacer el bot"]
         DQ -->|"Pasa"| SANITIZE["Sanitización y hash PII"]
     end
 
     subgraph Storage["4. Almacenamiento"]
-        SANITIZE -->|"Fase 1: MVP"| GS[("Google Sheets: raw_expenses")]
+        SANITIZE -->|"Fase 1: MVP (una escritura por lote)"| GS[("Google Sheets: raw_expenses")]
         SANITIZE -.->|"Fase 2: Target"| PG[("PostgreSQL")]
+        CORRECT -->|"actualiza la fila"| GS
+        CORRECT -.->|"actualiza la fila"| PG
         GS -.->|"gastos de ese usuario"| REPORT
     end
 
     DENY --> OUT["Respuesta al usuario vía Evolution API"]
     PEND --> OUT
     ASK --> OUT
+    SCOPE --> OUT
+    ASKQ --> OUT
     REPORT -->|"link del reporte"| OUT
-    GS -->|"confirmación"| OUT
+    GS -->|"confirmación (antes → después si fue corrección)"| OUT
     PG -.->|"confirmación"| OUT
 ```
 
@@ -70,7 +78,9 @@ flowchart TD
 - **Concurrencia:** se procesa un mensaje a la vez por número y se descartan las reentregas del webhook (mismo `message_id`).
 - **Audio:** se toma del base64 inline del webhook; si falta o viene corrupto, se descarga desde Evolution (`getBase64FromMediaMessage`) y se transcribe con Whisper.
 - **Aprobaciones en tiempo real:** un Apps Script en la hoja avisa a `/api/v1/webhooks/sheets` cuando se edita `Estado` y el bot olvida solo ese número ([guía](docs/apps_script_usuarios.md)). Si no se puede releer, falla cerrado.
-- **Reportes por demanda:** "quiero mi resumen" (texto o audio) no se registra como gasto: se genera un Spreadsheet con **solo los gastos de ese usuario** (filtro estricto por `user_phone_hash`) y se comparte en solo lectura con el email del onboarding.
+- **Reportes por demanda:** un pedido como "quiero mi resumen", "mis gastos" o "¿cuánto gasté este mes?" (texto o audio) no se registra como gasto: se genera un Spreadsheet con **solo los gastos de ese usuario** (filtro estricto por `user_phone_hash`) y se comparte en solo lectura con el email del onboarding. Se detecta por palabras clave (`resumen`, `reporte`, `informe`, `extracto`, `mis gastos`, `cuánto gasté`…), nunca si el mensaje trae un monto o un verbo de compra sin pedido ([report_intent.py](src/services/report_intent.py)).
+- **Imágenes y videos:** todavía no se lee su contenido (sin OCR). Una foto con descripción se registra con el texto de la descripción; sin descripción el bot pide que escriban el detalle y el monto, o que manden un audio. Los videos se ignoran.
+- **Orden de decisión:** una vez obtenido el texto (o la transcripción), el bot evalúa en este orden: pedido de reporte → lista numerada pendiente → mensaje citado (corrección) → corrección sin cita → extracción de un gasto nuevo. Detalle en las secciones *Gastos Múltiples en un Solo Mensaje* y *Edición y Corrección de Registros*.
 
 ---
 
@@ -88,6 +98,7 @@ bot-wpp/
 │   └── usuarios_onedit.gs         # Disparador de Google Apps Script (aprobaciones en tiempo real)
 ├── docs/
 │   ├── data_contract.json         # JSON Schema formal del LLM
+│   ├── backlog_ingenieria_datos.md # Estado de los requerimientos, decisiones de implementación y riesgos
 │   ├── sheets_schema.md           # Diccionario de datos de Google Sheets (gastos, usuarios y reportes)
 │   ├── apps_script_usuarios.md    # Instalación del Apps Script
 │   ├── instructivo_docker.md      # Guía punta a punta con Docker
@@ -127,9 +138,9 @@ Cada número que escribe se valida contra la pestaña `usuarios` de Google Sheet
 
 | `Estado` | Comportamiento |
 | :---: | :--- |
-| `1` Aprobado | Registro de gastos: texto, audio (Groq Whisper) o imagen con descripción. Usa `EXTRACTION_SYSTEM_PROMPT`. |
+| `1` Aprobado | Registro de uno o varios gastos por mensaje (texto, audio con Groq Whisper o imagen con descripción), corrección de gastos propios y reporte por demanda. Usa `EXTRACTION_SYSTEM_PROMPT` y `EDIT_SYSTEM_PROMPT`. |
 | `2` Rechazado | Mensaje estándar de acceso denegado; no se procesa nada. |
-| vacío / número nuevo | Onboarding (nombre y email, solo por texto) con `ONBOARDING_SYSTEM_PROMPT`. Se avisa que la cuenta requiere aprobación manual del administrador antes de poder registrar gastos. |
+| vacío / número nuevo | Onboarding (nombre y email, solo por texto): el LLM (`ONBOARDING_SYSTEM_PROMPT`) solo extrae los datos y una máquina de estados responde con texto fijo. Al completarlos se avisa que la cuenta requiere aprobación manual del administrador antes de poder registrar gastos. |
 
 Cualquier otro valor en `Estado` se trata como vacío: nunca otorga acceso.
 
@@ -193,7 +204,7 @@ Para evitar alucinaciones, el LLM responde bajo un esquema estricto JSON. Este c
 }
 ```
 
-> Consultá el esquema formal en [`docs/data_contract.json`](docs/data_contract.json). El contrato devuelve siempre una lista `transactions` (un elemento por gasto, máximo `MAX_TRANSACTIONS_PER_MESSAGE`) y sigue aceptando la clave antigua `transaction` con un solo gasto.
+> Consultá el esquema formal en [`docs/data_contract.json`](docs/data_contract.json). El contrato devuelve siempre una lista `transactions` (un elemento por gasto, máximo `MAX_TRANSACTIONS_PER_MESSAGE`; vacía si el mensaje no describe ningún gasto) y sigue aceptando la clave antigua `transaction` con un solo gasto.
 
 La taxonomía es **estrictamente en español** y `payment_method` es obligatorio:
 - **Categorías:** `Alimentación`, `Transporte`, `Vivienda`, `Servicios`, `Salud`, `Entretenimiento`, `Educación`, `Compras`, `Otros`.
@@ -201,7 +212,14 @@ La taxonomía es **estrictamente en español** y `payment_method` es obligatorio
 
 Se toleran diferencias de mayúsculas y tildes (`ALIMENTACION` → `Alimentación`), pero un valor fuera de la taxonomía se rechaza. Los enums, el prompt y el contrato JSON se mantienen sincronizados con un test.
 
-El onboarding tiene su propio contrato, definido en `ONBOARDING_SYSTEM_PROMPT`: `{"collected": {"full_name", "email"}, "reply"}`. El LLM solo extrae datos y redacta la próxima pregunta; el aviso final de aprobación manual es texto fijo.
+El onboarding tiene su propio contrato, definido en `ONBOARDING_SYSTEM_PROMPT`: `{"collected": {"full_name", "email"}}`. El LLM **solo extrae datos**; todas las respuestas son texto fijo elegido por una máquina de estados ([`onboarding_reply`](src/services/onboarding_service.py)) según lo que falte, así no gasta tokens en redactar ni puede alucinar:
+
+| Datos recolectados | Respuesta |
+| :--- | :--- |
+| Ninguno | ¡Hola! Para darte de alta y registrar tus gastos, necesito tu nombre, apellido y un email (preferentemente de Gmail). |
+| Solo el nombre | Tengo tu nombre, pero me falta tu email. ¿Me lo pasás? |
+| Solo el email | Tengo tu email, pero me falta tu nombre y apellido. |
+| Ambos | Aviso de que la cuenta requiere aprobación manual del administrador (estado final). |
 
 ---
 
@@ -319,16 +337,17 @@ Tabla `raw_whatsapp.expenses`, definida en [postgres_repo.py](src/infrastructure
 
 ## 🛡️ Reglas de Calidad de Datos
 
-Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viven en [`DataQualityGate`](src/services/data_quality.py):
+Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7, 9 y 10 viven en [`DataQualityGate`](src/services/data_quality.py); la taxonomía (punto 8) la validan los enums de [enums.py](src/domain/enums.py):
 1. **Acceso previo:** solo se procesan los mensajes de usuarios aprobados (estado `1`).
 2. **Idempotencia:** se descartan las reentregas del webhook (mismo `message_id`) y se valida que el mensaje no haya sido registrado ya: en Sheets contra la columna `message_id` (se lee una vez al arrancar, así que sobrevive a reinicios) y en PostgreSQL con una restricción única.
-3. **Confianza mínima:** si `confidence_score < 0.65`, el gasto no se guarda y se le pide al usuario que reenvíe el mensaje aclarando monto y concepto.
-4. **Monto:** debe ser mayor a 0 y se redondea a 2 decimales.
+3. **Confianza mínima:** si `confidence_score < 0.65`, el gasto no se guarda y se le pide al usuario que reenvíe el mensaje aclarando monto y concepto. La confianza es del mensaje, no del gasto: un mensaje confuso invalida todos sus gastos.
+4. **Monto y detalle:** el monto debe ser mayor a 0 (se redondea a 2 decimales) y el detalle (concepto) no puede estar vacío.
 5. **Moneda y fecha:** la moneda debe tener formato ISO 4217 (3 letras mayúsculas) y, si el usuario no menciona otra, se asume `ARS`. Una fecha futura genera una advertencia, no un rechazo.
 6. **Protección contra inyección de fórmulas:** si un campo de texto inicia con `=`, `+`, `-` o `@`, se antepone `'` para prevenir ejecución maliciosa en hojas de cálculo. El mismo tratamiento se aplica a los datos de onboarding.
 7. **Privacidad (PII):** el número telefónico se persiste hasheado (SHA-256) en `user_phone_hash` y los logs lo enmascaran. Los reportes filtran **solo** por ese hash.
 8. **Taxonomía en español:** la categoría y el medio de pago deben pertenecer a las listas de arriba; `payment_method` es obligatorio.
 9. **Uno o varios gastos:** la validación es por gasto, así que un ítem inválido de un lote no bloquea a los demás; el bot informa exactamente qué se guardó y qué no. Un mensaje con más de `MAX_TRANSACTIONS_PER_MESSAGE` gastos se rechaza pidiendo dividirlo.
+10. **Mensajes que no son un gasto:** un saludo o una pregunta general ("Hola bot", "¿qué es un mvp?") no debe terminar en un error técnico. Si el LLM no devuelve gastos, el gasto no trae monto (o es ≤ 0) o la confianza es menor a `0.30`, el bot responde *"No detecté ningún monto o gasto en tu mensaje. Recordá que solo puedo registrar transacciones financieras o generar tu resumen de gastos."* Entre `0.30` y `0.65` se trata como un gasto real pero poco claro y se pide aclarar monto y concepto (punto 3). En un lote, el mensaje solo aplica si **ningún** ítem parece un gasto; si alguno se registró, se detalla qué falló.
 
 ---
 
@@ -358,6 +377,7 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viv
    | Variable | Obligatoria | Descripción |
    | :--- | :---: | :--- |
    | `GROQ_API_KEY` | ✅ | API key de Groq. |
+   | `GROQ_LLM_MODEL` / `GROQ_WHISPER_MODEL` | | Modelos de extracción y de transcripción (por defecto `openai/gpt-oss-20b` y `whisper-large-v3`). |
    | `EVOLUTION_API_URL` | ✅ | URL base de Evolution API (si ambos corren en Docker, el nombre del servicio, por ejemplo `http://evolution_api:8080`). |
    | `EVOLUTION_API_KEY` | ✅ | API key de Evolution (global o de la instancia). |
    | `EVOLUTION_INSTANCE` | ✅ | Nombre de la instancia vinculada por QR. |
@@ -369,14 +389,22 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viv
    | `SHEETS_WEBHOOK_SECRET` | | Secreto del Apps Script de aprobaciones en tiempo real. Sin él, `/api/v1/webhooks/sheets` rechaza todo. |
    | `REPORTS_FOLDER_ID` | | Carpeta de Drive (compartida con los administradores) donde se crean los reportes. Si falta, quedan en el Drive de la cuenta de servicio. |
    | `REPORT_COOLDOWN_SECONDS` | | Segundos mínimos entre dos reportes del mismo usuario (por defecto `300`). |
+   | `GROQ_TIMEOUT_SECONDS` | | Máximo que el bot espera al LLM o a Whisper (por defecto `30`; el SDK usa 600 s y dejaría al usuario sin respuesta). |
+   | `GROQ_MAX_RETRIES` | | Reintentos del SDK de Groq ante 429/5xx (por defecto `2`). |
+   | `STORAGE_TIMEOUT_SECONDS` | | Máximo de una llamada a la base, Sheets o PostgreSQL (por defecto `20`). |
+   | `HTTP_TIMEOUT_SECONDS` | | Máximo de las llamadas a Evolution API; los audios usan el doble (por defecto `15`). |
+   | `MAX_TRANSACTIONS_PER_MESSAGE` | | Gastos que puede describir un solo mensaje; si lo supera, el bot pide dividirlo (por defecto `10`). |
+   | `PENDING_SELECTION_TTL_SECONDS` | | Segundos de validez de la lista numerada cuando el bot pregunta qué gasto de un lote corregir (por defecto `600`). |
    | `GOOGLE_APPLICATION_CREDENTIALS` / `GCP_SERVICE_ACCOUNT_B64` | | Credenciales de la cuenta de servicio, si el `.json` no está en `config/credentials/` (donde se detecta solo). |
    | `STORAGE_BACKEND` | | `sheets` (por defecto) o `postgres`. |
    | `POSTGRES_*` | | Conexión a PostgreSQL, solo con `STORAGE_BACKEND=postgres`. |
    | `TIMEZONE` | | Zona horaria de los timestamps (por defecto `America/Argentina/Buenos_Aires`). |
 
+   Las demás variables (`APP_NAME`, `ENVIRONMENT`, `DEBUG`, `LOG_LEVEL`, `PORT`) tienen valores por defecto: están comentadas en [.env.example](.env.example) y definidas en [config.py](src/core/config.py).
+
 3. **Preparar Google Sheets:**
    * Compartí el spreadsheet con el correo de la cuenta de servicio de GCP con rol de **Editor**, y habilitá la **Google Drive API** en su proyecto (para los reportes).
-   * Creá la pestaña `raw_expenses` (los 10 encabezados se crean solos si está vacía; si ya tiene otra estructura, reemplazala por la de [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-raw_expenses-registro-de-gastos)).
+   * Creá la pestaña `raw_expenses` (los 11 encabezados se crean solos si está vacía; `reply_message_id` es opcional, pero sin ella solo se puede corregir citando el mensaje propio del usuario. Si ya tiene otra estructura, reemplazala por la de [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-raw_expenses-registro-de-gastos)).
    * Creá la pestaña `usuarios` con los encabezados de [docs/sheets_schema.md](docs/sheets_schema.md#pestaña-usuarios-control-de-acceso). Si no existe, el bot no puede verificar a nadie y rechaza todos los mensajes.
 4. **Levantar el servicio:**
    ```bash
@@ -393,7 +421,7 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 8 viv
    ```bash
    python scripts/setup_evolution_webhook.py --url https://<tu-dominio>/api/v1/webhooks/evolution
    ```
-6. **Probar:** agregá tu número a la pestaña `usuarios` con `estado` = `1` (o escribile al bot desde un número nuevo y aprobalo después) y enviá un mensaje: *"Gasté 15 USD en almuerzo con débito"*.
+6. **Probar:** agregá tu número a la pestaña `usuarios` con `Estado` = `1` (o escribile al bot desde un número nuevo y aprobalo después) y enviá un mensaje: *"Gasté 15 USD en almuerzo con débito"*.
 
 ### Tests y diagnóstico
 ```bash

@@ -12,7 +12,7 @@ from src.domain.models import (
 )
 from src.infrastructure.storage.sheets_repo import GoogleSheetsExpenseRepository
 from src.infrastructure.whatsapp.parser import ParsedWhatsAppMessage
-from src.services.data_quality import DataQualityGate
+from src.services.data_quality import NO_EXPENSE_DETECTED_MESSAGE, DataQualityGate
 from src.services.expense_service import ExpenseProcessingService
 from tests.fakes import FakeExpenseRepository, FakeGroq, FakeWhatsApp, FakeWhisper, FakeWorksheet
 
@@ -23,7 +23,7 @@ USER_HASH = DataQualityGate.hash_phone_number(PHONE)
 TODAY = date(2026, 10, 28)
 
 
-def tx(amount: float, category=CategoryEnum.ALIMENTACION, description: str = "Café", currency: str = "ARS"):
+def tx(amount: float | None, category=CategoryEnum.ALIMENTACION, description: str = "Café", currency: str = "ARS"):
     return ExtractedTransaction(
         transaction_date=TODAY,
         amount=amount,
@@ -101,9 +101,14 @@ async def test_the_contract_accepts_the_new_list_and_the_legacy_single_transacti
     assert legacy.is_batch is False and batch.is_batch is False
 
 
-async def test_an_empty_list_is_rejected_by_the_contract():
-    with pytest.raises(ValueError):
-        LLMExtractionResponse(metadata=ExtractionMetadata(confidence_score=0.9, raw_text="x"), transactions=[])
+async def test_an_empty_list_is_valid_and_means_the_message_is_not_an_expense():
+    response = LLMExtractionResponse(
+        metadata=ExtractionMetadata(confidence_score=0.0, raw_text="Hola bot"), transactions=[]
+    )
+
+    assert response.transactions == [] and response.transaction is None and response.is_batch is False
+    [result] = DataQualityGate.validate_transactions(response, "MSG-1", PHONE, InputTypeEnum.TEXT)
+    assert result.is_valid is False and result.no_expense_detected is True
 
 
 # ------------------------------------------------------------------ gate
@@ -197,12 +202,40 @@ async def test_a_partially_invalid_batch_saves_the_valid_rows_and_explains_the_r
 
 async def test_when_nothing_validates_the_user_is_told_nothing_was_saved(parts):
     service, groq, repo, whatsapp = parts
-    groq.expense_result = two_expenses(confidence=0.2)
+    groq.expense_result = two_expenses(confidence=0.5)  # unclear, but they do look like expenses
 
     await service.process_incoming_message(message())
 
     assert repo.saved == []
     assert "No pude registrar ninguno de los 2 gastos" in whatsapp.texts[0]
+
+
+async def test_when_no_item_has_an_amount_the_user_gets_the_scope_explanation(parts):
+    service, groq, repo, whatsapp = parts
+    groq.expense_result = LLMExtractionResponse(
+        metadata=ExtractionMetadata(confidence_score=0.9, raw_text="a"), transactions=[tx(None), tx(None)]
+    )
+
+    await service.process_incoming_message(message("compré cosas"))
+
+    assert repo.saved == []
+    assert whatsapp.texts == [NO_EXPENSE_DETECTED_MESSAGE]
+
+
+async def test_a_missing_amount_in_one_item_does_not_hide_the_ones_that_were_saved(parts):
+    service, groq, repo, whatsapp = parts
+    groq.expense_result = LLMExtractionResponse(
+        metadata=ExtractionMetadata(confidence_score=0.95, raw_text="a"),
+        transactions=[tx(20000.0, CategoryEnum.ENTRETENIMIENTO, "Pochoclos"), tx(None, description="Estacionamiento")],
+    )
+
+    await service.process_incoming_message(message())
+
+    assert [r.amount for r in repo.saved] == [20000.0]
+    text = whatsapp.texts[0]
+    assert "Se registraron 1 de 2 gastos" in text
+    assert "Falta el monto del gasto" in text
+    assert NO_EXPENSE_DETECTED_MESSAGE not in text
 
 
 async def test_a_write_failure_reports_that_no_batch_row_was_saved(parts):

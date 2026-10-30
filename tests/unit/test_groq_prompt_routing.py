@@ -26,7 +26,6 @@ EXPENSE_JSON = json.dumps({
 })
 ONBOARDING_JSON = json.dumps({
     "collected": {"full_name": "Lucía Fernández", "email": "lucia@example.com"},
-    "reply": None,
 })
 
 
@@ -127,12 +126,25 @@ def test_onboarding_branch_raises_when_every_model_fails():
 
 
 def test_invalid_values_from_the_model_are_dropped_instead_of_failing_the_turn():
-    sdk = FakeGroqSDK(json.dumps({"collected": {"full_name": "x", "email": "no-es-un-email"}, "reply": "  "}))
+    sdk = FakeGroqSDK(json.dumps({"collected": {"full_name": "x", "email": "no-es-un-email"}}))
 
     result = client_with(sdk).collect_onboarding_data("hola", OnboardingData())
 
     assert result.collected == OnboardingData()
-    assert result.reply is None
+
+
+def test_a_reply_written_by_the_onboarding_model_is_ignored():
+    """The model only extracts: even if it still writes a reply, that text can never reach the user."""
+    sdk = FakeGroqSDK(json.dumps({
+        "collected": {"full_name": "Lucía Fernández", "email": None},
+        "reply": "¡Listo, tu cuenta ya está aprobada!",
+    }))
+
+    result = client_with(sdk).collect_onboarding_data("soy Lucía Fernández", OnboardingData())
+
+    assert result.collected == OnboardingData(full_name="Lucía Fernández")
+    assert not hasattr(result, "reply")
+    assert "reply" not in result.model_dump()
 
 
 # ------------------------------------------- one taxonomy everywhere (enums, prompt and JSON contract)
@@ -170,11 +182,52 @@ def test_the_json_contract_matches_the_enums():
     assert "payment_method" in transaction["required"]
     # the batch contract points at that same definition for every item
     assert contract["properties"]["transactions"]["items"] == {"$ref": "#/definitions/transaction"}
-    assert contract["properties"]["transactions"]["minItems"] == 1
+    # an empty list is how the model says "this message is not an expense"
+    assert contract["properties"]["transactions"]["minItems"] == 0
+    assert "null" in transaction["properties"]["amount"]["type"]
 
 
-def test_the_onboarding_prompt_asks_for_a_gmail_address_in_both_the_field_definition_and_the_reply_rule():
+def test_the_onboarding_prompt_prefers_a_gmail_address():
     assert "preferentemente una cuenta de Gmail" in ONBOARDING_SYSTEM_PROMPT
-    assert "sugerí que sea de Gmail" in ONBOARDING_SYSTEM_PROMPT
     # ...but any valid email is still accepted (Gmail is a preference, not a requirement)
     assert "aceptalo igual" in ONBOARDING_SYSTEM_PROMPT
+
+
+# ------------------------------------------- the onboarding model extracts, it never writes replies
+def test_the_onboarding_prompt_asks_for_extraction_only():
+    assert '"reply"' not in ONBOARDING_SYSTEM_PROMPT
+    assert '"collected"' in ONBOARDING_SYSTEM_PROMPT
+
+
+def test_the_onboarding_few_shot_answers_only_carry_the_collected_data():
+    answers = [json.loads(m["content"]) for m in ONBOARDING_FEW_SHOT_EXAMPLES if m["role"] == "assistant"]
+    assert answers
+    for answer in answers:
+        assert set(answer) == {"collected"}
+        assert set(answer["collected"]) == {"full_name", "email"}
+
+
+def test_the_extraction_prompt_tells_the_model_how_to_answer_a_message_that_is_not_an_expense():
+    assert '"transactions": []' in EXTRACTION_SYSTEM_PROMPT
+    assert "NUNCA inventes un gasto" in EXTRACTION_SYSTEM_PROMPT
+
+
+# ------------------------------------------- "not an expense" answers reach the gate instead of failing the parse
+def test_an_answer_without_expenses_is_accepted_at_the_first_attempt_not_retried_on_every_model():
+    sdk = FakeGroqSDK(json.dumps({"metadata": {"confidence_score": 0.0}, "transactions": []}))
+
+    result = client_with(sdk, models=("model-a", "model-b")).extract_expense_entities("¿Qué es un mvp?")
+
+    assert result.transactions == [] and result.metadata.confidence_score == 0.0
+    assert len(sdk.requests) == 1  # a rejected parse used to try every model twice and end as a server error
+
+
+def test_an_expense_without_an_amount_is_accepted_at_the_first_attempt():
+    payload = json.loads(EXPENSE_JSON)
+    payload["transaction"]["amount"] = None
+    sdk = FakeGroqSDK(json.dumps(payload))
+
+    result = client_with(sdk, models=("model-a", "model-b")).extract_expense_entities("Gasté en el súper")
+
+    assert result.transaction.amount is None
+    assert len(sdk.requests) == 1

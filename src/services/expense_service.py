@@ -16,7 +16,7 @@ from src.infrastructure.storage.base import ExpenseRepositoryInterface
 from src.infrastructure.whatsapp.client import EvolutionAPIClient, decode_base64_media
 from src.infrastructure.whatsapp.parser import ParsedWhatsAppMessage
 from src.services.batch_selection import PendingSelection, PendingSelectionStore, describe, numbered
-from src.services.data_quality import DataQualityGate
+from src.services.data_quality import NO_EXPENSE_DETECTED_MESSAGE, DataQualityGate
 from src.services.edit_intent import is_correction_reference, mentions_currency, mentions_date, parse_selection
 from src.services.report_intent import is_report_request
 from src.services.report_service import ReportService
@@ -43,6 +43,10 @@ STORAGE_TIMEOUT_MESSAGE = (
 )
 EMPTY_TEXT_MESSAGE = (
     "⚠️ No pudimos entender el mensaje. No se registró nada: probá con un audio más claro o escribí el gasto."
+)
+IMAGE_NOT_READABLE_MESSAGE = (
+    "📸 Recibimos tu imagen. Por ahora no puedo leer fotos o videos automáticamente. "
+    "Por favor, escribime el detalle y el monto, o mandame un audio."
 )
 
 # Edit mode (quoting a message)
@@ -226,12 +230,10 @@ class ExpenseProcessingService:
             raw_text = parsed_msg.text_content or ""
 
         elif parsed_msg.input_type == InputTypeEnum.IMAGE:
-            # MVP handles image caption if provided
+            # The image itself is not read (no OCR yet): only its caption, when there is one
             raw_text = parsed_msg.text_content or ""
             if not raw_text:
-                return _PipelineOutcome(
-                    reply="📸 Recibimos tu ticket. Para el MVP, añade un comentario de texto con el monto o envíalo por audio."
-                )
+                return _PipelineOutcome(reply=IMAGE_NOT_READABLE_MESSAGE)
 
         if not raw_text.strip():
             logger.warning("Empty raw text extracted. Aborting processing.")
@@ -333,11 +335,15 @@ class ExpenseProcessingService:
             errors=[error for result in results for error in result.errors],
             warnings=[warning for result in results for warning in result.warnings],
             sanitized_record=None,
+            no_expense_detected=all(result.no_expense_detected for result in results),
         )
 
     @staticmethod
     def _validation_failure_message(results: list[DataQualityResult]) -> str:
-        """Why nothing was registered, one entry per detected expense."""
+        """Why nothing was registered: an explanation of the bot's scope, or one entry per detected expense."""
+        # Nothing looks like an expense (greeting, general question, no amount): say what the bot is for
+        if all(result.no_expense_detected for result in results):
+            return NO_EXPENSE_DETECTED_MESSAGE
         if len(results) == 1:
             reasons = "\n- ".join(results[0].errors)
             return (

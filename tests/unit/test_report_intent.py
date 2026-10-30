@@ -23,6 +23,18 @@ from src.services.report_intent import is_report_request
         "QUIERO MI RESUMEN!!!",
         "mandame el reporte",
         "Quiero mi resumén",
+        # natural language: the keyword is enough, no fixed phrase is needed
+        "resumen de este mes por favor",
+        "mis gastos",
+        "mostrame mis gastos",
+        "gastos del mes",
+        "¿cuánto gasté?",
+        "Cuánto gasté este mes?",
+        "¿cuánta plata gasté en total?",
+        "cuánto llevo gastado",
+        "Hola, ¿me podés pasar un resumen de todo lo que gasté este mes?",
+        "quiero ver mi reporte de los últimos 30 días",
+        "Cuánto gasté en 2026?",
     ],
 )
 def test_report_requests_are_detected(text):
@@ -44,6 +56,15 @@ def test_report_requests_are_detected(text):
         "compré un libro de resumen de matemática ayer en la librería del centro por favor",
         "",
         "   ",
+        # out-of-domain chatter has no report keyword
+        "Qué es un mvp?",
+        "Hola bot",
+        # a bare number is an amount too, whatever the keyword next to it
+        "anotá mis gastos de hoy: café 500",
+        "compré mis gastos comunes 300",
+        "gasté en el súper",
+        # correcting a record is not asking for a report
+        "me equivoqué en mis gastos de ayer",
     ],
 )
 def test_expenses_and_chatter_are_never_taken_for_report_requests(text):
@@ -58,3 +79,9 @@ def test_a_request_with_an_amount_is_an_expense():
 
 def test_non_text_input_is_not_a_request():
     assert is_report_request(None) is False
+
+
+def test_numbers_that_name_a_period_do_not_make_a_request_an_expense():
+    assert is_report_request("resumen de octubre 2026") is True
+    assert is_report_request("mis gastos de los últimos 30 días") is True
+    assert is_report_request("mis gastos de 500") is False

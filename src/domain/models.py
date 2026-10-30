@@ -65,13 +65,17 @@ class ExtractedTransaction(BaseModel):
 
     The hard business rules (positive amount, ISO currency, non-empty detail) live in the Data Quality
     Gate, not here: with several expenses per message, one bad item must not discard the whole batch.
+    That includes a missing amount: it reaches the gate, which answers it with a friendly message, instead of
+    failing the parse (and every model retry) with a server error.
     """
     transaction_date: date = Field(..., description="Purchase date in ISO 8601 (YYYY-MM-DD)")
     transaction_time: Optional[time] = Field(
         default=None,
         description="Transaction time (HH:mm:ss) or None",
     )
-    amount: float = Field(..., description="Total amount with up to 2 decimal places (validated by the gate)")
+    amount: Optional[float] = Field(
+        default=None, description="Total amount with up to 2 decimal places (required, validated by the gate)"
+    )
     currency: str = Field(..., description="ISO 4217 currency code (validated by the gate)")
     category: CategoryEnum = Field(default=CategoryEnum.OTROS, description="Macro category")
     subcategory: str = Field(default="Otros", description="Granular subcategory")
@@ -89,8 +93,8 @@ class ExtractedTransaction(BaseModel):
 
     @field_validator("amount")
     @classmethod
-    def round_amount(cls, v: float) -> float:
-        return round(v, 2)
+    def round_amount(cls, v: Optional[float]) -> Optional[float]:
+        return None if v is None else round(v, 2)
 
 
 class LLMExtractionResponse(BaseModel):
@@ -99,11 +103,13 @@ class LLMExtractionResponse(BaseModel):
     One message may describe several expenses, so the contract carries a list. The legacy single
     `transaction` key is still accepted (the correction branch and older prompts use it) and the two
     views are kept in sync, so callers can keep reading `response.transaction` for a single expense.
+    An empty list is valid: it is how the model says the message is not an expense at all ("Hola", a general
+    question), and the Data Quality Gate turns it into an explanatory reply.
     """
     metadata: ExtractionMetadata
     transactions: list[ExtractedTransaction] = Field(
         default_factory=list,
-        description="One entry per expense described in the message (at least one)",
+        description="One entry per expense described in the message (empty when the message is not an expense)",
     )
     transaction: Optional[ExtractedTransaction] = Field(
         default=None,
@@ -114,8 +120,6 @@ class LLMExtractionResponse(BaseModel):
     def sync_single_and_multi_views(self) -> "LLMExtractionResponse":
         if not self.transactions and self.transaction is not None:
             self.transactions = [self.transaction]
-        if not self.transactions:
-            raise ValueError("the response must contain at least one transaction")
         if self.transaction is None and len(self.transactions) == 1:
             self.transaction = self.transactions[0]
         return self
@@ -186,6 +190,9 @@ class DataQualityResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     sanitized_record: Optional[ExpenseRecord] = None
+    # No expense was found in the message (very low confidence, no transactions or no amount): the user gets an
+    # explanation of what the bot does instead of a request to clarify
+    no_expense_detected: bool = False
 
 
 class OnboardingData(BaseModel):
@@ -229,21 +236,16 @@ class OnboardingData(BaseModel):
 
 
 class OnboardingLLMResponse(BaseModel):
-    """Top-level contract expected from the onboarding LLM branch."""
+    """Top-level contract expected from the onboarding LLM branch: extraction only, the reply is fixed copy.
+
+    A stray `reply` key from the model is ignored (pydantic drops unknown keys), so it never reaches the user.
+    """
     collected: OnboardingData = Field(default_factory=OnboardingData)
-    reply: Optional[str] = Field(default=None, description="Next question for the user, null when nothing is missing")
 
     @field_validator("collected", mode="before")
     @classmethod
     def collected_defaults_to_empty(cls, v: Any) -> Any:
         return {} if v is None else v
-
-    @field_validator("reply", mode="before")
-    @classmethod
-    def clean_reply(cls, v: Any) -> Optional[str]:
-        if not isinstance(v, str):
-            return None
-        return v.strip() or None
 
 
 class UserRecord(BaseModel):

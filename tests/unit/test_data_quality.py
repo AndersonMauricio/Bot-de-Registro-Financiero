@@ -72,3 +72,78 @@ def test_data_quality_gate_rejects_low_confidence():
     assert result.is_valid is False
     assert any("confianza" in err.lower() for err in result.errors)
     assert result.sanitized_record is None
+
+
+# ------------------------------------------------ out of domain: no expense in the message
+def _response(confidence: float, *transactions: ExtractedTransaction) -> LLMExtractionResponse:
+    return LLMExtractionResponse(
+        metadata=ExtractionMetadata(confidence_score=confidence, raw_text="mensaje"), transactions=list(transactions)
+    )
+
+
+def _transaction(amount) -> ExtractedTransaction:
+    return ExtractedTransaction(
+        transaction_date=date(2026, 10, 19),
+        amount=amount,
+        currency="ARS",
+        category=CategoryEnum.OTROS,
+        subcategory="Otros",
+        payment_method=PaymentMethodEnum.NO_ESPECIFICADO,
+        description="Algo",
+    )
+
+
+def _validate(response: LLMExtractionResponse):
+    return DataQualityGate.validate_and_sanitize(response, "msg_1", "5491100000000", InputTypeEnum.TEXT)
+
+
+def test_a_message_without_transactions_is_flagged_as_no_expense():
+    result = _validate(_response(0.0))
+
+    assert result.is_valid is False and result.no_expense_detected is True
+    assert result.sanitized_record is None
+
+
+def test_a_missing_amount_is_flagged_as_no_expense_with_its_own_error():
+    result = _validate(_response(0.9, _transaction(None)))
+
+    assert result.is_valid is False and result.no_expense_detected is True
+    assert result.errors == ["Falta el monto del gasto."]
+
+
+def test_a_zero_amount_is_flagged_as_no_expense():
+    result = _validate(_response(0.9, _transaction(0.0)))
+
+    assert result.is_valid is False and result.no_expense_detected is True
+
+
+def test_a_very_low_confidence_is_flagged_as_no_expense_and_keeps_the_technical_error_for_the_logs():
+    result = _validate(_response(0.1, _transaction(100.0)))
+
+    assert result.is_valid is False and result.no_expense_detected is True
+    assert any("confianza" in err.lower() for err in result.errors)
+
+
+def test_an_unclear_expense_is_rejected_but_not_flagged_as_no_expense():
+    """Confidence between the out-of-domain and the minimum thresholds: the user is asked to clarify."""
+    below_minimum = DataQualityGate.MIN_CONFIDENCE_THRESHOLD - 0.01
+    assert DataQualityGate.OUT_OF_DOMAIN_CONFIDENCE_THRESHOLD < below_minimum
+
+    for confidence in (DataQualityGate.OUT_OF_DOMAIN_CONFIDENCE_THRESHOLD, 0.5, below_minimum):
+        result = _validate(_response(confidence, _transaction(100.0)))
+        assert result.is_valid is False and result.no_expense_detected is False, confidence
+
+
+def test_a_valid_expense_is_never_flagged_as_no_expense():
+    result = _validate(_response(0.95, _transaction(100.0)))
+
+    assert result.is_valid is True and result.no_expense_detected is False
+
+
+def test_the_scope_explanation_is_the_agreed_copy():
+    from src.services.data_quality import NO_EXPENSE_DETECTED_MESSAGE
+
+    assert NO_EXPENSE_DETECTED_MESSAGE == (
+        "No detecté ningún monto o gasto en tu mensaje. Recordá que solo puedo registrar transacciones "
+        "financieras o generar tu resumen de gastos."
+    )

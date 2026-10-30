@@ -15,6 +15,10 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 | 7 | Edición y corrección de registros (update por cita) | ✅ | Agregar la columna `reply_message_id` a `raw_expenses` (o `ALTER TABLE` en PostgreSQL): [sheets_schema.md](sheets_schema.md) |
 | 8 | Gastos múltiples por mensaje (batching) | ✅ | Nada. El `message_id` del lote se sufija `-0`, `-1`, … sin cambios de esquema |
 | 9 | Degradación controlada ante caídas de servicios | ✅ | Opcional: ajustar `GROQ_TIMEOUT_SECONDS`, `STORAGE_TIMEOUT_SECONDS`, `HTTP_TIMEOUT_SECONDS` y `MAX_TRANSACTIONS_PER_MESSAGE` en el `.env` |
+| 10 | Onboarding como máquina de estados (el LLM solo extrae, las respuestas son texto fijo) | ✅ | Nada |
+| 11 | Mensaje de contingencia multimedia sin jerga técnica | ✅ | Nada. Los videos siguen ignorándose en silencio (el parser solo conoce texto, audio e imagen) |
+| 12 | Detector de reportes por palabras clave | ✅ | Nada |
+| 13 | Mensajes fuera de dominio (sin error técnico) | ✅ | Nada |
 
 ### Decisiones de implementación
 
@@ -30,6 +34,14 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 - **Punto 9 – timeouts:** el SDK de Groq arranca con 600 s de espera; ahora LLM y Whisper usan `GROQ_TIMEOUT_SECONDS` (30 s) + `GROQ_MAX_RETRIES`, y todo se ejecuta con `run_blocking` (cota dura por llamada). Evolution usa `HTTP_TIMEOUT_SECONDS`.
 - **Punto 9 – mensajes honestos:** se distingue "no se guardó nada" (falla de escritura) de "puede que no se haya guardado" (timeout de escritura: la cancelación de `asyncio` no detiene el hilo).
 
+- **Punto 10 – FSM sin estado propio:** el estado del onboarding ya vive en la hoja `usuarios` (qué datos están cargados), así que `onboarding_reply` es una función pura de esos datos y no hace falta persistir nada más. La respuesta se elige **después** de combinar lo extraído con lo guardado: un mensaje sin datos nuevos repite lo que falta. `OnboardingLLMResponse` ya no tiene `reply`: si un modelo lo sigue escribiendo, la clave se descarta y jamás llega al usuario. Se mantiene la llamada al LLM aunque sea el primer contacto, porque el primer mensaje puede traer los datos ("Soy Lucía, lucia@example.com").
+- **Punto 11 – dónde está el texto:** vive en `expense_service.py` (no en el router): el router solo decide por estado de acceso. Se responde únicamente a las imágenes **sin descripción**; con descripción se registra el texto como siempre.
+- **Punto 12 – palabras clave con salvaguardas:** `report_intent.py` busca `resumen`, `reporte`, `informe`, `extracto`, `planilla`, `mis gastos`, `gastos del mes` y `cuánto gasté` (y variantes) en el texto normalizado, y sube el tope de palabras de 15 a 25. Para que un gasto real no se confunda con un pedido: (a) cualquier número que no sea un año ni un período ("últimos 30 días") descarta el pedido; (b) un verbo de compra (`pagué`, `compré`…) sin verbo de pedido lo descarta ("pagué el resumen de la tarjeta"); (c) una corrección ("me equivoqué en mis gastos") tampoco es un reporte. "Cuánto gasté" es en sí mismo el pedido.
+- **Punto 13 – para que el gate pueda responder:** hasta ahora una respuesta del LLM sin gastos (`transactions: []`) o sin monto fallaba en Pydantic, `_complete_json` reintentaba con todos los modelos candidatos y el usuario recibía "error en el servidor de IA". Ahora `transactions` puede venir vacía y `amount` puede ser `null`: ambas llegan al `DataQualityGate`, que marca el resultado con `no_expense_detected`. El prompt de extracción indica explícitamente devolver `transactions: []` y `confidence_score: 0.0` ante un mensaje que no es un gasto, y `null` si falta el monto.
+- **Punto 13 – umbral de "confianza muy baja":** `OUT_OF_DOMAIN_CONFIDENCE_THRESHOLD = 0.30`. Entre 0.30 y 0.65 (`MIN_CONFIDENCE_THRESHOLD`) sigue siendo un gasto real pero poco claro y se pide aclarar monto y concepto. Es un valor elegido, no medido: conviene ajustarlo con mensajes reales.
+- **Punto 13 – lotes:** el mensaje educativo solo se muestra si **todos** los ítems fueron marcados; si alguno se registró, la respuesta detalla qué falló (por ejemplo, "Falta el monto del gasto").
+- **Punto 13 – correcciones:** una corrección que el LLM devuelve vacía o sin monto sigue contestando con el mensaje de corrección ("No pude aplicar la corrección…"), no con el de fuera de dominio, que no tendría sentido ahí.
+
 ### Riesgos a tener presentes
 
 - **El hash no es un secreto fuerte:** SHA-256 sin sal de un número de teléfono se revierte por fuerza bruta (hay pocos números posibles). Sirve para no exponer el teléfono a simple vista y para filtrar, pero no protege ante quien tenga acceso a la hoja y quiera descubrir un número. Una mejora posible es `HMAC-SHA256` con una clave del servidor.
@@ -44,6 +56,9 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 - **La selección pendiente vive en el proceso:** igual que la caché de usuarios, no se comparte entre workers. El bot ya exige un solo worker de uvicorn.
 - **El lote es todo o nada en la escritura:** no hay transacción en Sheets, así que la escritura es un único `append_rows`; si falla, el usuario recibe "no se guardó nada" y puede reenviar sin riesgo de filas huérfanas.
 - **La confianza es del mensaje, no del ítem:** `confidence_score` es global, así que un mensaje confuso invalida todos sus gastos aunque los montos se hayan leído bien.
+- **Un saludo sigue costando una llamada al LLM:** el mensaje fuera de dominio se detecta en el Data Quality Gate, es decir, después de consultar a Groq. Filtrar saludos con una regla determinista ahorraría tokens, pero se dejó fuera para no rechazar gastos reales por error.
+- **"mis gastos" es ambiguo:** sin monto ni verbo de compra se interpreta como un pedido de reporte, así que "anotá mis gastos de hoy" genera un reporte en lugar de registrar. Es el costo de relajar la detección; el enfriamiento (`REPORT_COOLDOWN_SECONDS`) acota el daño.
+- **Los videos no tienen respuesta:** el parser ignora todo lo que no sea texto, audio o imagen, así que quien manda un video no recibe ningún aviso.
 
 ---
 
@@ -57,6 +72,7 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 **Objetivo:** Capturar la información necesaria para el provisionamiento de reportes privados (Data Serving).
 * **Actualización de Prompt (`ONBOARDING_SYSTEM_PROMPT`):** El LLM debe preguntar y extraer obligatoriamente una dirección de correo electrónico (preferentemente Gmail).
 * **Persistencia:** Guardar este correo en la base de usuarios para utilizarlo posteriormente en la asignación de permisos de Google Drive.
+* **Actualización (punto 10):** el LLM ya no pregunta ni redacta: solo extrae `full_name` y `email`, y las preguntas son texto fijo de una máquina de estados.
 
 ## 3. Taxonomía y Enriquecimiento de Datos (Calidad de Datos)
 **Objetivo:** Normalizar la entrada para el futuro modelado dimensional (dbt) y la visualización (Superset).
@@ -116,7 +132,7 @@ Estructura obligatoria para gestionar los accesos:
 ## 8. Soporte para Gastos Múltiples (Batching)
 **Objetivo:** Procesar notas de voz o textos largos con más de una transacción en un solo envío.
 
-* **Contrato:** el LLM devuelve `transactions` (lista, minItems 1, maxItems `MAX_TRANSACTIONS_PER_MESSAGE`) en lugar de un objeto único `transaction`; la clave vieja se acepta por compatibilidad.
+* **Contrato:** el LLM devuelve `transactions` (lista, maxItems `MAX_TRANSACTIONS_PER_MESSAGE`; puede venir vacía si el mensaje no es un gasto, ver punto 13) en lugar de un objeto único `transaction`; la clave vieja se acepta por compatibilidad.
 * **Calidad de datos:** `DataQualityGate.validate_transactions` valida cada gasto por separado y asigna `message_id` = `<id>` para un gasto único o `<id>-0`, `<id>-1`, … para un lote.
 * **Persistencia:** una sola escritura por lote (`append_rows` en Sheets, `INSERT` multi-fila en PostgreSQL); si falla no se guarda ninguna fila y el usuario lo sabe.
 * **Confirmación numerada** y corrección por selección cuando la cita corresponde a un lote.
@@ -127,3 +143,29 @@ Estructura obligatoria para gestionar los accesos:
 * **Timeouts explícitos:** `GROQ_TIMEOUT_SECONDS` y `GROQ_MAX_RETRIES` en los SDK de Groq/Whisper, `HTTP_TIMEOUT_SECONDS` en Evolution y `STORAGE_TIMEOUT_SECONDS` en el repositorio.
 * **Cota dura por llamada:** `run_blocking` envuelve cada llamada bloqueante con `asyncio.wait_for`, de modo que ninguna caída deja al usuario esperando.
 * **Mensajes por clase de falla:** IA caída, base caída ("no se guardó nada"), timeout de escritura ("puede que no se haya guardado") y excepción no prevista (mensaje genérico del router con log contextual).
+
+## 10. Onboarding como Máquina de Estados (FSM)
+**Objetivo:** Reducir tokens, latencia y alucinaciones (errores de puntuación, promesas de aprobación) sacando al LLM de la redacción de respuestas.
+
+* **`ONBOARDING_SYSTEM_PROMPT`:** sin la clave `reply`; el LLM devuelve estrictamente `{"collected": {"full_name": "...", "email": "..."}}`.
+* **`onboarding_service.py`:** `onboarding_reply(data)` evalúa con `if/else` puros qué falta y devuelve un texto fijo:
+  * Nada recolectado: "¡Hola! Para darte de alta y registrar tus gastos, necesito tu nombre, apellido y un email (preferentemente de Gmail)."
+  * Falta el email: "Tengo tu nombre, pero me falta tu email. ¿Me lo pasás?"
+  * Falta el nombre: "Tengo tu email, pero me falta tu nombre y apellido."
+  * Completo: aviso fijo de aprobación manual (sin cambios).
+
+## 11. Mensaje de Contingencia Multimedia
+**Objetivo:** Eliminar la jerga técnica ("MVP") de cara al usuario final.
+
+* **`expense_service.py`:** una imagen sin descripción recibe *"📸 Recibimos tu imagen. Por ahora no puedo leer fotos o videos automáticamente. Por favor, escribime el detalle y el monto, o mandame un audio."*
+
+## 12. Detector de Reportes por Palabras Clave
+**Objetivo:** Evitar que pedidos de resumen en lenguaje natural caigan en el pipeline de gastos y generen errores técnicos.
+
+* **`report_intent.py`:** búsqueda por palabras clave (`resumen`, `reporte`, `mis gastos`, `cuánto gasté`…) en lugar de la frase estricta, con salvaguardas para no confundir un gasto con un pedido (ver decisiones del punto 12).
+
+## 13. Mensajes Fuera de Dominio
+**Objetivo:** Si el usuario hace una pregunta general ("¿Qué es un mvp?", "Hola bot"), no intentar extraer un gasto ni mostrar un error técnico.
+
+* **`data_quality.py`:** si no hay gastos, falta el monto o la confianza es menor a 0.30, el resultado se marca con `no_expense_detected` y el bot responde *"No detecté ningún monto o gasto en tu mensaje. Recordá que solo puedo registrar transacciones financieras o generar tu resumen de gastos."*
+* **Contrato:** `transactions` puede venir vacía y `amount` puede ser `null` (el prompt de extracción lo indica) para que la respuesta llegue al gate en lugar de fallar el parseo.
