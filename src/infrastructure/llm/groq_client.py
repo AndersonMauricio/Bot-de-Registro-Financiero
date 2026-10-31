@@ -56,9 +56,7 @@ class GroqLLMClient:
             priority_patterns = [
                 "gpt-oss-20b",
                 "gpt-oss-120b",
-                "qwen3.8",
-                "3.3-70b",
-                "3.1-8b",
+                "qwen3",
             ]
             for pat in priority_patterns:
                 for cm in chat_models:
@@ -72,13 +70,11 @@ class GroqLLMClient:
         except Exception as e:
             logger.warning(f"Could not list Groq models dynamically: {e}")
 
-        # Static fallbacks
+        # Static fallbacks: only model ids Groq still serves, otherwise every one of them answers 404
         for fb in [
             "openai/gpt-oss-20b",
             "openai/gpt-oss-120b",
             "qwen/qwen3.8-27b",
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
         ]:
             if fb not in candidates:
                 candidates.append(fb)
@@ -107,6 +103,11 @@ class GroqLLMClient:
             return json.loads(match.group(1).strip())
 
         raise json.JSONDecodeError("No valid JSON object found in response", content, 0)
+
+    @staticmethod
+    def _is_model_unavailable(error: Exception) -> bool:
+        """A model id the account does not serve (or a rejected key) never succeeds on a second attempt."""
+        return getattr(error, "status_code", None) in (401, 403, 404)
 
     def _complete_json(self, messages: list[dict], parse: Callable[[dict], T]) -> T:
         """Run a chat completion across candidate models until one yields JSON that `parse` accepts."""
@@ -140,7 +141,7 @@ class GroqLLMClient:
 
                 except Exception as e:
                     last_error = e
-                    if use_json_format:
+                    if use_json_format and not self._is_model_unavailable(e):
                         logger.warning(
                             f"Groq strict json_format failed on model '{model_name}': {e}. Retrying same model in standard prompt mode..."
                         )
@@ -148,6 +149,7 @@ class GroqLLMClient:
                         logger.warning(
                             f"Groq model '{model_name}' failed completely: {e}. Trying next candidate..."
                         )
+                        break
 
         logger.error(f"All candidate Groq models failed. Last error: {last_error}")
         raise ExtractionError(f"Groq API extraction failed: {last_error}") from last_error
