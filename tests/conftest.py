@@ -2,8 +2,22 @@
 
 import pytest
 from datetime import date
+from src.core.config import settings
 from src.domain.enums import CategoryEnum, PaymentMethodEnum
 from src.domain.models import ExtractedTransaction, ExtractionMetadata, LLMExtractionResponse
+
+# The tests advance a fake clock by fixed seconds, so they depend on the documented default TTL,
+# not on whatever a developer has in their local `.env`.
+USER_CACHE_TTL_SECONDS_UNDER_TEST = 60
+
+
+@pytest.fixture(autouse=True)
+def _settings_do_not_leak_from_the_environment(monkeypatch):
+    """Pin the settings the tests reason about to their documented defaults.
+
+    Without this, a local `.env` (or an exported variable) silently changes the behaviour under test.
+    """
+    monkeypatch.setattr(settings, "USER_CACHE_TTL_SECONDS", USER_CACHE_TTL_SECONDS_UNDER_TEST)
 
 
 @pytest.fixture
