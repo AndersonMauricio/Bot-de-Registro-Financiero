@@ -187,13 +187,14 @@ Mientras Groq procesa, el chat muestra "escribiendo…".
 | Ver logs de Evolution | `docker compose logs -f evolution-api` (en `~/evolution`) |
 | Cambiaste el `.env` del bot | `docker compose up -d --force-recreate app` (un `restart` **no** relee el `.env`) |
 | Reconstruir tras cambiar código | `docker compose up -d --build app` |
-| Apagar | `docker compose down` en cada carpeta |
+| Apagar | `docker compose down` en cada carpeta. El bot espera a los mensajes en vuelo: el `stop_grace_period: 90s` del compose evita que Docker los corte (normalmente baja al instante). |
 | Borrar también los datos | `docker compose down -v`. En Evolution esto elimina la sesión de WhatsApp: hay que volver a escanear el QR. |
 
 ## 🩺 Si algo falla
 
 | Síntoma | Causa probable | Qué hacer |
 | :--- | :--- | :--- |
+| ¿Está bien configurado? | — | `curl localhost:8000/api/v1/health/ready`: `200` = listo; `503` = la lista `missing` dice qué variable falta |
 | El webhook responde **503** (log: `EVOLUTION_WEBHOOK_SECRET is not configured`) | Falta la variable en el `.env`, o no recreaste el contenedor | Completala y corré `docker compose up -d --force-recreate app` |
 | **401** `Invalid webhook secret` | El secreto del `.env` no coincide con el guardado en Evolution | Repetí el Paso 4 |
 | El bot procesa pero no contesta (log: `Failed to send WhatsApp message`) | `EVOLUTION_API_URL` con `localhost` (dentro del contenedor apunta al propio contenedor), o `EVOLUTION_API_KEY` / `EVOLUTION_INSTANCE` mal | Usá `http://host.docker.internal:8080` y revisá las otras dos |

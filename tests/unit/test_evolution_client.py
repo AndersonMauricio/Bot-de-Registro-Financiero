@@ -7,7 +7,7 @@ import time
 import httpx
 import pytest
 from src.core.exceptions import WhatsAppClientError
-from src.infrastructure.whatsapp.client import EvolutionAPIClient, decode_base64_media
+from src.infrastructure.whatsapp.client import SEND_ATTEMPTS, EvolutionAPIClient, decode_base64_media
 
 pytestmark = pytest.mark.asyncio
 
@@ -246,3 +246,55 @@ async def test_send_text_message_still_answers_true_or_false():
 
     assert await make_client(gateway).send_text_message(PHONE, "hola") is True
     assert gateway.json() == {"number": PHONE, "text": "hola"}
+
+
+# ------------------------------------------------------------- transient failures
+class FlakyGateway(Gateway):
+    """Answers `failures` times with `fail_status`, then behaves like a healthy gateway."""
+
+    def __init__(self, failures: int, fail_status: int = 503, **kwargs):
+        super().__init__(**kwargs)
+        self.failures = failures
+        self.fail_status = fail_status
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.failures > 0:
+            self.failures -= 1
+            return httpx.Response(self.fail_status, json={"message": "temporarily unavailable"})
+        return httpx.Response(self.status, json=self.body)
+
+
+async def test_a_transient_gateway_failure_is_retried_once():
+    """An expense already saved must not stay without its confirmation because of one hiccup."""
+    gateway = FlakyGateway(failures=1, fail_status=503, body={"key": {"id": "BOT-MSG-1"}})
+
+    assert await make_client(gateway, retry_delay_seconds=0).send_text_message(PHONE, "hola") is True
+
+    assert gateway.calls_to("/message/sendText/my-instance") == 2
+
+
+async def test_a_rejected_request_is_not_retried():
+    gateway = Gateway(status=400)
+
+    assert await make_client(gateway, retry_delay_seconds=0).send_text_message(PHONE, "hola") is False
+
+    assert gateway.calls_to("/message/sendText/my-instance") == 1
+
+
+async def test_the_retries_are_bounded_and_end_with_false(caplog):
+    gateway = FlakyGateway(failures=10, fail_status=500)
+
+    with caplog.at_level("ERROR", logger="bot_wpp"):
+        assert await make_client(gateway, retry_delay_seconds=0).send_text_message(PHONE, "hola") is False
+
+    assert gateway.calls_to("/message/sendText/my-instance") == SEND_ATTEMPTS
+    assert PHONE not in caplog.text  # phones are masked in logs
+
+
+async def test_a_transient_failure_while_downloading_media_is_retried_once():
+    gateway = FlakyGateway(failures=1, fail_status=502, body={"base64": "T2dnUw=="})
+
+    assert await make_client(gateway, retry_delay_seconds=0).download_media("msg") == b"OggS"
+
+    assert gateway.calls_to("/getBase64FromMediaMessage/my-instance") == 2

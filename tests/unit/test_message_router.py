@@ -56,12 +56,12 @@ class RecordingFlow:
             self.running -= 1
 
 
-def build(users: dict = None, expense=None, onboarding=None):
+def build(users: dict = None, expense=None, onboarding=None, max_concurrent=None):
     repo = FakeUserRepository(users)
     whatsapp = FakeWhatsApp()
     expense = expense or RecordingFlow()
     onboarding = onboarding or RecordingFlow()
-    router = MessageRouter(repo, expense, onboarding, whatsapp)
+    router = MessageRouter(repo, expense, onboarding, whatsapp, max_concurrent=max_concurrent)
     return router, repo, whatsapp, expense, onboarding
 
 
@@ -177,3 +177,32 @@ async def test_lock_registry_does_not_grow_with_every_sender():
         await router.handle(message(f"m{i}", f"54911000000{i:02d}"))
 
     assert len(router._locks) == 0
+
+
+async def test_the_global_slot_queues_a_burst_instead_of_hammering_groq():
+    """A paste of many messages must not open one LLM call per message at once (that ends in 429s)."""
+    onboarding = RecordingFlow(delay=0.05)
+    router, _, _, _, _ = build({}, onboarding=onboarding, max_concurrent=1)
+
+    await asyncio.gather(
+        router.handle(message("m1", PHONE)),
+        router.handle(message("m2", "5491100000002")),
+        router.handle(message("m3", "5491100000003")),
+    )
+
+    assert len(onboarding.calls) == 3
+    assert onboarding.max_running == 1
+
+
+async def test_wait_until_idle_reports_what_is_still_in_flight():
+    """On shutdown the process must know whether a message could be cut off."""
+    onboarding = RecordingFlow(delay=0.2)
+    router, _, _, _, _ = build({}, onboarding=onboarding)
+
+    task = asyncio.create_task(router.handle(message()))
+    await asyncio.sleep(0.05)
+
+    assert await router.wait_until_idle(timeout=0.01) == 1  # no budget left: report the pending message
+
+    await task
+    assert await router.wait_until_idle(timeout=1.0) == 0

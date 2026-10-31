@@ -4,12 +4,19 @@ import asyncio
 import base64
 from datetime import date
 import pytest
+from src.core.config import settings
 from src.core.exceptions import ExtractionError, TranscriptionError
 from src.domain.enums import InputTypeEnum, PaymentMethodEnum
 from src.domain.models import ExtractedTransaction, ExtractionMetadata, LLMExtractionResponse
 from src.infrastructure.whatsapp.parser import ParsedWhatsAppMessage
 from src.services.data_quality import NO_EXPENSE_DETECTED_MESSAGE
-from src.services.expense_service import IMAGE_NOT_READABLE_MESSAGE, ExpenseProcessingService
+from src.services.expense_service import (
+    AUDIO_TOO_LARGE_MESSAGE,
+    IMAGE_NOT_READABLE_MESSAGE,
+    MESSAGE_TOO_LONG_MESSAGE,
+    UNSUPPORTED_CONTENT_MESSAGE,
+    ExpenseProcessingService,
+)
 from tests.fakes import FakeExpenseRepository, FakeGroq, FakeWhatsApp, FakeWhisper
 
 pytestmark = pytest.mark.asyncio
@@ -382,3 +389,43 @@ async def test_without_a_report_service_report_requests_behave_as_before(parts):
     await service.process_incoming_message(text_message("Quiero mi resumen"))
 
     assert groq.expense_calls == ["Quiero mi resumen"]
+
+
+# ------------------------------------------------------------- size guard rails
+async def test_an_oversized_message_is_answered_without_calling_the_llm(parts, monkeypatch):
+    service, groq, _, repo, whatsapp = parts
+    monkeypatch.setattr(settings, "MAX_TEXT_CHARS", 50)
+
+    await service.process_incoming_message(text_message("gasté " + "500 en café " * 20))
+
+    assert groq.expense_calls == []  # no tokens are spent on input that cannot be processed
+    assert repo.saved == []
+    assert whatsapp.texts == [MESSAGE_TOO_LONG_MESSAGE]
+
+
+async def test_an_oversized_audio_is_answered_before_spending_whisper(parts, monkeypatch):
+    service, groq, whisper, repo, whatsapp = parts
+    monkeypatch.setattr(settings, "MAX_AUDIO_BYTES", 4)  # AUDIO_BYTES is longer than that
+
+    await service.process_incoming_message(audio_message())
+
+    assert whisper.calls == []
+    assert groq.expense_calls == []
+    assert repo.saved == []
+    assert whatsapp.texts == [AUDIO_TOO_LARGE_MESSAGE]
+
+
+async def test_content_the_bot_cannot_read_is_answered_with_the_scope_message(parts):
+    """A video or a sticker used to get absolute silence: the user must know what the bot can do."""
+    service, groq, whisper, repo, whatsapp = parts
+    unsupported = ParsedWhatsAppMessage(
+        message_id="msg-video-1",
+        sender_phone=PHONE,
+        timestamp="1729382400",
+        input_type=InputTypeEnum.UNSUPPORTED,
+    )
+
+    await service.process_incoming_message(unsupported)
+
+    assert whatsapp.texts == [UNSUPPORTED_CONTENT_MESSAGE]
+    assert groq.expense_calls == [] and whisper.calls == [] and repo.saved == []

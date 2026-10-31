@@ -5,6 +5,8 @@ services:
       dockerfile: docker/Dockerfile
     container_name: bot_wpp_app
     restart: unless-stopped
+    # Evolution already received its 200: give the messages in flight time to finish instead of losing them
+    stop_grace_period: 90s
     ports:
       - "8000:8000"
     env_file:

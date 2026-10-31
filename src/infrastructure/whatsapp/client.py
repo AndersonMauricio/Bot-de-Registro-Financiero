@@ -16,6 +16,18 @@ from src.core.phone import mask_phone
 # drops the "typing..." indicator after ~25 s. One request per chunk keeps it alive without gaps.
 PRESENCE_CHUNK_MS = 20_000
 
+# A transient gateway failure must not cost the user the confirmation of an expense that is already
+# saved (they would resend it and create a duplicate row): one bounded retry, never a retry storm.
+SEND_ATTEMPTS = 2
+RETRY_DELAY_SECONDS = 0.5
+
+
+def _is_transient_failure(error: Exception) -> bool:
+    """Timeouts, connection errors and 429/5xx may succeed on a second attempt; any other 4xx never will."""
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code == 429 or error.response.status_code >= 500
+    return isinstance(error, httpx.TransportError)
+
 
 def decode_base64_media(data: str) -> bytes:
     """Decode media delivered by Evolution as base64 (optionally as a data URI)."""
@@ -40,11 +52,13 @@ class EvolutionAPIClient:
         instance: Optional[str] = None,
         presence_chunk_ms: int = PRESENCE_CHUNK_MS,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        retry_delay_seconds: float = RETRY_DELAY_SECONDS,
     ):
         self.base_url = (base_url or settings.EVOLUTION_API_URL).rstrip("/")
         self.api_key = settings.EVOLUTION_API_KEY.get_secret_value() if api_key is None else api_key
         self.instance = settings.EVOLUTION_INSTANCE if instance is None else instance
         self.presence_chunk_ms = presence_chunk_ms
+        self.retry_delay_seconds = retry_delay_seconds
         self._transport = transport
 
     @property
@@ -120,20 +134,43 @@ class EvolutionAPIClient:
         return delivered, message_id
 
     async def _post_text(self, payload: dict, recipient_phone: str) -> tuple[bool, Optional[str]]:
-        async with self._http(timeout=settings.HTTP_TIMEOUT_SECONDS) as client:
+        """POST message/sendText, retrying once when the failure looks transient.
+
+        Delivering the confirmation matters more than saving one request: without it the user cannot
+        know that the expense was saved.
+        """
+        last_error: Optional[Exception] = None
+        for attempt in range(1, SEND_ATTEMPTS + 1):
             try:
-                response = await client.post(self._url("message/sendText"), headers=self.headers, json=payload)
-                response.raise_for_status()
+                message_id = await self._post_text_once(payload, recipient_phone)
                 logger.info(f"WhatsApp reply sent successfully to {mask_phone(recipient_phone)}.")
-                return True, self._sent_message_id(response)
+                return True, message_id
             except httpx.HTTPStatusError as e:
+                last_error = e
                 logger.error(
-                    f"Failed to send WhatsApp message to {mask_phone(recipient_phone)}: HTTP {e.response.status_code}"
+                    f"Failed to send WhatsApp message to {mask_phone(recipient_phone)}: "
+                    f"HTTP {e.response.status_code} (attempt {attempt}/{SEND_ATTEMPTS})"
                 )
-                return False, None
             except httpx.HTTPError as e:
-                logger.error(f"Failed to send WhatsApp message to {mask_phone(recipient_phone)}: {e!r}")
-                return False, None
+                last_error = e
+                logger.error(
+                    f"Failed to send WhatsApp message to {mask_phone(recipient_phone)}: "
+                    f"{e!r} (attempt {attempt}/{SEND_ATTEMPTS})"
+                )
+
+            if attempt >= SEND_ATTEMPTS or not _is_transient_failure(last_error):
+                break
+            await asyncio.sleep(self.retry_delay_seconds)
+
+        logger.error(f"WhatsApp message to {mask_phone(recipient_phone)} could not be delivered.")
+        return False, None
+
+    async def _post_text_once(self, payload: dict, recipient_phone: str) -> Optional[str]:
+        """One POST attempt; returns the id of the created WhatsApp message."""
+        async with self._http(timeout=settings.HTTP_TIMEOUT_SECONDS) as client:
+            response = await client.post(self._url("message/sendText"), headers=self.headers, json=payload)
+            response.raise_for_status()
+        return self._sent_message_id(response)
 
     @staticmethod
     def _sent_message_id(response: httpx.Response) -> Optional[str]:
@@ -203,22 +240,33 @@ class EvolutionAPIClient:
             logger.warning(f"Typing presence stopped unexpectedly: {e!r}")
 
     async def download_media(self, message_id: str) -> bytes:
-        """Download a received media message (already decrypted) through Evolution's getBase64FromMediaMessage."""
+        """Download a received media message (already decrypted) through Evolution's getBase64FromMediaMessage.
+
+        Reading is idempotent, so a transient gateway failure is retried once, like a send.
+        """
         if not self.is_configured:
             raise WhatsAppClientError("Evolution API credentials missing for media download.")
 
         payload = {"message": {"key": {"id": message_id}}, "convertToMp4": False}
 
-        async with self._http(timeout=self.media_timeout) as client:
+        body: object = {}
+        for attempt in range(1, SEND_ATTEMPTS + 1):
             try:
-                response = await client.post(
-                    self._url("chat/getBase64FromMediaMessage"), headers=self.headers, json=payload
-                )
-                response.raise_for_status()
-                body = response.json()
+                async with self._http(timeout=self.media_timeout) as client:
+                    response = await client.post(
+                        self._url("chat/getBase64FromMediaMessage"), headers=self.headers, json=payload
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                break
             except (httpx.HTTPError, ValueError) as e:
-                logger.error(f"Error downloading WhatsApp media for message {message_id}: {e!r}")
-                raise WhatsAppClientError(f"Evolution media download failed: {e!r}") from e
+                logger.error(
+                    f"Error downloading WhatsApp media for message {message_id}: {e!r} "
+                    f"(attempt {attempt}/{SEND_ATTEMPTS})"
+                )
+                if attempt >= SEND_ATTEMPTS or not _is_transient_failure(e):
+                    raise WhatsAppClientError(f"Evolution media download failed: {e!r}") from e
+                await asyncio.sleep(self.retry_delay_seconds)
 
         encoded = body.get("base64") if isinstance(body, dict) else None
         if not encoded:

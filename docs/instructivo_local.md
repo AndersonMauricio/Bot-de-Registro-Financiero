@@ -160,6 +160,7 @@ Ahora sí, en la terminal del bot (carpeta del repo) arrancalo con el comando de
 
 ```bash
 curl -s localhost:8000/api/v1/health     # {"status":"ok",...}
+curl -s localhost:8000/api/v1/health/ready  # {"status":"ready"} o 503 con la lista "missing"
 ```
 
 ### 4. Conectar Evolution con el bot

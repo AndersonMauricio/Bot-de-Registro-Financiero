@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Optional
 from src.core.async_utils import run_blocking
+from src.core.clock import local_today
 from src.core.config import settings
 from src.core.exceptions import ServiceTimeoutError, WhatsAppClientError
 from src.core.logging import logger
@@ -47,6 +48,19 @@ EMPTY_TEXT_MESSAGE = (
 IMAGE_NOT_READABLE_MESSAGE = (
     "📸 Recibimos tu imagen. Por ahora no puedo leer fotos o videos automáticamente. "
     "Por favor, escribime el detalle y el monto, o mandame un audio."
+)
+MESSAGE_TOO_LONG_MESSAGE = (
+    "⚠️ El mensaje es demasiado largo para procesarlo. No se registró nada: "
+    "dividilo en varios mensajes o contame un gasto por mensaje."
+)
+AUDIO_TOO_LARGE_MESSAGE = (
+    "⚠️ El audio es demasiado largo para procesarlo. No se registró nada: "
+    "mandalo en partes o escribí el gasto."
+)
+UNSUPPORTED_CONTENT_MESSAGE = (
+    "📎 Recibí un contenido que todavía no puedo leer (video, documento, sticker, ubicación o encuesta). "
+    "Por ahora solo proceso texto, audios y fotos con descripción. "
+    "Escribime el detalle y el monto, o mandame un audio."
 )
 
 # Edit mode (quoting a message)
@@ -209,9 +223,19 @@ class ExpenseProcessingService:
         # 2. Extract or Transcribe Text
         raw_text: str = ""
 
+        # Content the bot cannot read is answered right away: no transcription, no LLM, no storage
+        if parsed_msg.input_type == InputTypeEnum.UNSUPPORTED:
+            return _PipelineOutcome(reply=UNSUPPORTED_CONTENT_MESSAGE)
+
         if parsed_msg.input_type == InputTypeEnum.AUDIO:
             try:
                 audio_bytes = await self._get_audio_bytes(parsed_msg)
+                if len(audio_bytes) > settings.MAX_AUDIO_BYTES:
+                    logger.warning(
+                        f"Audio of message {parsed_msg.message_id} has {len(audio_bytes)} bytes "
+                        f"(max {settings.MAX_AUDIO_BYTES}); not transcribed."
+                    )
+                    return _PipelineOutcome(reply=AUDIO_TOO_LARGE_MESSAGE)
                 raw_text = await run_blocking(
                     self.whisper_client.transcribe_audio_bytes,
                     audio_bytes,
@@ -239,6 +263,14 @@ class ExpenseProcessingService:
             logger.warning("Empty raw text extracted. Aborting processing.")
             return _PipelineOutcome(reply=EMPTY_TEXT_MESSAGE)
 
+        # Absurdly long text (or transcription) would only burn tokens and fail at the provider
+        if len(raw_text) > settings.MAX_TEXT_CHARS:
+            logger.warning(
+                f"Message {parsed_msg.message_id} has {len(raw_text)} characters "
+                f"(max {settings.MAX_TEXT_CHARS}); not processed."
+            )
+            return _PipelineOutcome(reply=MESSAGE_TOO_LONG_MESSAGE)
+
         # 2b. Report requests ("quiero mi resumen") are answered with the user's own data, never extracted as expenses
         if self.report_service and is_report_request(raw_text):
             logger.info(f"Report requested by {mask_phone(parsed_msg.sender_phone)}.")
@@ -265,7 +297,7 @@ class ExpenseProcessingService:
             llm_result = await run_blocking(
                 self.groq_client.extract_expense_entities,
                 text=raw_text,
-                reference_date=date.today(),
+                reference_date=local_today(),
                 timeout=settings.GROQ_TIMEOUT_SECONDS,
                 label="expense extraction",
             )
@@ -290,6 +322,7 @@ class ExpenseProcessingService:
             message_id=parsed_msg.message_id,
             user_phone=parsed_msg.sender_phone,
             input_type=parsed_msg.input_type,
+            today=local_today(),
         )
         summary = self._summarize(results)
         records = [result.sanitized_record for result in results if result.sanitized_record]
@@ -542,7 +575,7 @@ class ExpenseProcessingService:
                 self.groq_client.correct_expense_entities,
                 text=raw_text,
                 original=self._as_contract_transaction(original),
-                reference_date=date.today(),
+                reference_date=local_today(),
                 timeout=settings.GROQ_TIMEOUT_SECONDS,
                 label="expense correction",
             )
@@ -563,6 +596,7 @@ class ExpenseProcessingService:
             message_id=message_id,
             user_phone=parsed_msg.sender_phone,
             input_type=parsed_msg.input_type,
+            today=local_today(),
         )
         record = dq_result.sanitized_record
 

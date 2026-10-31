@@ -63,6 +63,14 @@ async def receive_evolution_event(
     message_router: MessageRouter = Depends(get_message_router),
 ):
     """Receive Evolution API `messages.upsert` events and dispatch asynchronous processing."""
+    # A payload this big is not a WhatsApp message; answering 200 avoids an endless retry of the same body
+    content_length = request.headers.get("content-length", "")
+    if content_length.isdigit() and int(content_length) > settings.MAX_WEBHOOK_BYTES:
+        logger.warning(
+            f"Ignored a webhook payload of {int(content_length)} bytes (max {settings.MAX_WEBHOOK_BYTES})."
+        )
+        return {"status": "IGNORED"}
+
     try:
         payload = await request.json()
     except Exception as e:

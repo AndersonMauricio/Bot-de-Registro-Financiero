@@ -4,6 +4,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from types import SimpleNamespace
 import pytest
 from src.core.exceptions import StorageError
 from src.domain.enums import InputTypeEnum
@@ -369,3 +370,64 @@ def test_an_older_sheet_without_the_reply_column_still_corrects_the_users_own_me
     assert repo.find_expense_by_message_id("BOT-REPLY-1", HASH_A) is None
     assert repo.update_expense(record("msg-1", amount=15000.0)) is True
     assert dict(zip(header, ws.rows[1]))["monto"] == 15000.0
+
+
+# ------------------------------------------------------------- transient failures
+class ApiError(Exception):
+    """Stands in for gspread.exceptions.APIError (the retry helper reads the HTTP status by duck typing)."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP {status_code}")
+        self.response = SimpleNamespace(status_code=status_code)
+
+
+class FlakyWorksheet(FakeWorksheet):
+    """Fails the first `failures` reads/writes with `error`, then behaves like the in-memory sheet."""
+
+    def __init__(self, rows, error, failures=1):
+        super().__init__(rows)
+        self.error = error
+        self.failures = failures
+
+    def _maybe_fail(self):
+        if self.failures > 0:
+            self.failures -= 1
+            raise self.error
+
+    def get_all_values(self, **kwargs):
+        self._maybe_fail()
+        return super().get_all_values(**kwargs)
+
+    def append_row(self, values, value_input_option=None, **kwargs):
+        self._maybe_fail()
+        super().append_row(values, value_input_option, **kwargs)
+
+
+def test_a_quota_error_on_a_read_is_retried_once(monkeypatch):
+    monkeypatch.setattr(sheets_repo, "RETRY_DELAY_SECONDS", 0)
+    ws = FlakyWorksheet([EXPENSE_SHEET_HEADERS], ApiError(429))
+
+    assert repo_for(ws).get_expenses_by_user(HASH_A) == []
+    assert ws.failures == 0  # the retry was made
+
+
+def test_a_server_error_on_a_write_is_not_retried(monkeypatch):
+    """Repeating an append that may have landed would duplicate the expense."""
+    monkeypatch.setattr(sheets_repo, "RETRY_DELAY_SECONDS", 0)
+    ws = FlakyWorksheet([EXPENSE_SHEET_HEADERS], ApiError(500))
+
+    with pytest.raises(StorageError):
+        repo_for(ws).save_expense(record("msg-1"))
+
+    assert ws.appends == []
+    assert ws.failures == 0
+
+
+def test_a_quota_error_on_a_write_is_retried_once(monkeypatch):
+    """429 means the quota window rejected the call without applying it, so repeating it is safe."""
+    monkeypatch.setattr(sheets_repo, "RETRY_DELAY_SECONDS", 0)
+    ws = FlakyWorksheet([EXPENSE_SHEET_HEADERS], ApiError(429))
+
+    repo_for(ws).save_expense(record("msg-1"))
+
+    assert len(ws.appends) == 1

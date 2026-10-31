@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     MAX_TRANSACTIONS_PER_MESSAGE: int = Field(default=10, ge=1)
     # How long the numbered options of a batch stay valid for a follow-up correction
     PENDING_SELECTION_TTL_SECONDS: int = Field(default=600, ge=1)
+    # Guard rails: an oversized message, audio or webhook is answered with an instruction instead of
+    # burning a provider call (Groq/Whisper) on input that can only fail
+    MAX_TEXT_CHARS: int = Field(default=8000, ge=1)
+    MAX_AUDIO_BYTES: int = Field(default=20_000_000, ge=1)
+    MAX_WEBHOOK_BYTES: int = Field(default=35_000_000, ge=1)
+    # Messages processed in parallel: a burst is queued instead of provoking a Groq 429 storm
+    MAX_CONCURRENT_MESSAGES: int = Field(default=4, ge=1)
+    # How long a shutdown waits for the messages already in flight before giving up
+    SHUTDOWN_DRAIN_SECONDS: float = Field(default=25.0, ge=0)
 
     # Evolution API (WhatsApp gateway)
     EVOLUTION_API_URL: str = Field(default="http://localhost:8080")

@@ -51,6 +51,9 @@ class InputTypeEnum(str, Enum):
     TEXT = "TEXT"
     AUDIO = "AUDIO"
     IMAGE = "IMAGE"
+    # Real user content the bot cannot read yet (video, document, sticker, location, contact, poll):
+    # answered with a fixed message instead of silence, and never persisted
+    UNSUPPORTED = "UNSUPPORTED"
 
 
 class UserStatusEnum(int, Enum):

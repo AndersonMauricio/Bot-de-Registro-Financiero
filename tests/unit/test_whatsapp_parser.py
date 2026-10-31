@@ -104,9 +104,49 @@ def test_unwraps_disappearing_messages(make_evolution_payload):
     assert msg.text_content == "gasté 300"
 
 
-def test_ignores_unsupported_message_types(make_evolution_payload):
+def test_user_content_the_bot_cannot_read_gets_a_fixed_answer(make_evolution_payload):
+    """A sticker/video/document is real user content: silence would look like the bot is broken."""
     payload = make_evolution_payload({"stickerMessage": {"mimetype": "image/webp"}}, "stickerMessage")
-    assert WhatsAppPayloadParser.parse_webhook(payload) is None
+
+    msg = WhatsAppPayloadParser.parse_webhook(payload)
+
+    assert msg is not None
+    assert msg.input_type == InputTypeEnum.UNSUPPORTED
+    assert msg.text_content is None
+
+
+@pytest.mark.parametrize(
+    "content, message_type",
+    [
+        ({"videoMessage": {"caption": "", "mimetype": "video/mp4"}}, "videoMessage"),
+        ({"documentMessage": {"fileName": "ticket.pdf", "mimetype": "application/pdf"}}, "documentMessage"),
+        (
+            {"documentWithCaptionMessage": {"message": {"documentMessage": {"fileName": "ticket.pdf"}}}},
+            "documentWithCaptionMessage",
+        ),
+        ({"locationMessage": {"degreesLatitude": 0.0, "degreesLongitude": 0.0}}, "locationMessage"),
+        ({"contactMessage": {"displayName": "Contacto"}}, "contactMessage"),
+        ({"pollCreationMessage": {"name": "¿Dónde comemos?"}}, "pollCreationMessage"),
+    ],
+)
+def test_every_unreadable_user_content_is_recognized(make_evolution_payload, content, message_type):
+    msg = WhatsAppPayloadParser.parse_webhook(make_evolution_payload(content, message_type))
+
+    assert msg is not None
+    assert msg.input_type == InputTypeEnum.UNSUPPORTED
+
+
+@pytest.mark.parametrize(
+    "content, message_type",
+    [
+        ({"reactionMessage": {"text": "👍", "key": {"id": "X"}}}, "reactionMessage"),
+        ({"protocolMessage": {"type": "REVOKE"}}, "protocolMessage"),
+        ({"pollUpdateMessage": {"pollCreationMessageKey": {"id": "X"}}}, "pollUpdateMessage"),
+    ],
+)
+def test_messages_that_are_not_user_content_stay_silent(make_evolution_payload, content, message_type):
+    """Reactions, protocol messages and poll votes would only generate noise."""
+    assert WhatsAppPayloadParser.parse_webhook(make_evolution_payload(content, message_type)) is None
 
 
 def test_ignores_empty_text(make_evolution_payload):

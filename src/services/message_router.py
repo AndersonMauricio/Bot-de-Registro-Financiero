@@ -3,6 +3,7 @@
 import asyncio
 import weakref
 from typing import Optional
+from src.core.config import settings
 from src.core.exceptions import StorageError
 from src.core.logging import logger
 from src.core.phone import mask_phone, phone_key
@@ -44,6 +45,7 @@ class MessageRouter:
         onboarding_service: OnboardingService,
         whatsapp_client: EvolutionAPIClient,
         seen_messages: Optional[TTLCache] = None,
+        max_concurrent: Optional[int] = None,
     ):
         self.user_repository = user_repository
         self.expense_service = expense_service
@@ -52,6 +54,31 @@ class MessageRouter:
         self._seen: TTLCache = seen_messages or TTLCache(SEEN_MESSAGES_TTL_SECONDS)
         # Locks disappear on their own once no message from that sender is being processed
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        # A burst is queued instead of firing one LLM/Sheets call per message at once (Groq answers 429)
+        self._slots = asyncio.Semaphore(max_concurrent or settings.MAX_CONCURRENT_MESSAGES)
+        # Messages being processed or waiting for a slot, so a shutdown can wait for them
+        self._active = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    def _begin(self) -> None:
+        self._active += 1
+        self._idle.clear()
+
+    def _end(self) -> None:
+        self._active -= 1
+        if self._active <= 0:
+            self._idle.set()
+
+    async def wait_until_idle(self, timeout: float) -> int:
+        """Wait up to `timeout` seconds for the messages in flight; return how many are still pending."""
+        if self._active <= 0 or timeout <= 0:
+            return max(self._active, 0)
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"Still {self._active} message(s) in flight after waiting {timeout:.0f}s.")
+        return max(self._active, 0)
 
     def _lock_for(self, phone: str) -> asyncio.Lock:
         key = phone_key(phone)
@@ -69,15 +96,21 @@ class MessageRouter:
             logger.info(f"Duplicate delivery of message {parsed_msg.message_id} ignored.")
             return
 
-        # One message at a time per sender keeps onboarding state consistent (no duplicated rows or replies)
-        async with self._lock_for(phone):
-            try:
-                await self._dispatch(parsed_msg)
-            except Exception:
-                logger.exception(
-                    f"Unhandled error processing message {parsed_msg.message_id} from {mask_phone(phone)}"
-                )
-                await self.whatsapp_client.send_text_message(phone, UNEXPECTED_ERROR_MESSAGE)
+        self._begin()
+        try:
+            # One message at a time per sender keeps onboarding state consistent (no duplicated rows or
+            # replies); the global slot bounds how many messages reach Groq and Sheets at once
+            async with self._lock_for(phone):
+                async with self._slots:
+                    try:
+                        await self._dispatch(parsed_msg)
+                    except Exception:
+                        logger.exception(
+                            f"Unhandled error processing message {parsed_msg.message_id} from {mask_phone(phone)}"
+                        )
+                        await self.whatsapp_client.send_text_message(phone, UNEXPECTED_ERROR_MESSAGE)
+        finally:
+            self._end()
 
     async def _dispatch(self, parsed_msg: ParsedWhatsAppMessage) -> None:
         phone = parsed_msg.sender_phone

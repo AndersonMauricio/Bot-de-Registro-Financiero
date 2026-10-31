@@ -19,6 +19,11 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 | 11 | Mensaje de contingencia multimedia sin jerga técnica | ✅ | Nada. Los videos siguen ignorándose en silencio (el parser solo conoce texto, audio e imagen) |
 | 12 | Detector de reportes por palabras clave | ✅ | Nada |
 | 13 | Mensajes fuera de dominio (sin error técnico) | ✅ | Nada |
+| 14 | Fecha local según `TIMEZONE` (el contenedor corre en UTC) | ✅ | Nada. `tzdata` ya está en `requirements.txt` |
+| 15 | Límites de entrada y respuesta a contenido no soportado | ✅ | Opcional: ajustar `MAX_TEXT_CHARS`, `MAX_AUDIO_BYTES`, `MAX_WEBHOOK_BYTES` |
+| 16 | Reintento de entrega (Evolution) y reintento seguro ante cuota de Sheets | ✅ | Nada |
+| 17 | Tope de concurrencia y apagado ordenado | ✅ | Nada. El `stop_grace_period` ya está en el compose |
+| 18 | `/health/ready` y esquema de PostgreSQL automático | ✅ | Nada. Ya no hay que crear el esquema a mano |
 
 ### Decisiones de implementación
 
@@ -42,6 +47,12 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 - **Punto 13 – lotes:** el mensaje educativo solo se muestra si **todos** los ítems fueron marcados; si alguno se registró, la respuesta detalla qué falló (por ejemplo, "Falta el monto del gasto").
 - **Punto 13 – correcciones:** una corrección que el LLM devuelve vacía o sin monto sigue contestando con el mensaje de corrección ("No pude aplicar la corrección…"), no con el de fuera de dominio, que no tendría sentido ahí.
 
+- **Punto 14 – fecha local:** `local_today()` usa `settings.TIMEZONE`; se agregó `tzdata` a `requirements.txt` porque, sin él, `ZoneInfo` no resuelve ningún nombre de zona y el fallback UTC-3 pasaba inadvertido (solo correcto para Argentina). El gate recibe la fecha como parámetro para que la advertencia de "fecha futura" use la misma que el LLM.
+- **Punto 15 – límites:** se evalúan antes de cualquier llamada paga. El webhook devuelve `200 IGNORED` (y no `413`) para no romper la regla de "Evolution no debe reintentar".
+- **Punto 16 – reintentos:** el envío se reintenta una vez ante timeout/conexión/`429`/`5xx`; un `4xx` no. En Sheets, las lecturas reintentan `429`/`5xx`; las escrituras solo `429`.
+- **Punto 17 – concurrencia y apagado:** el semáforo es global (`MAX_CONCURRENT_MESSAGES`) y el lock por número se toma primero. `wait_until_idle` cuenta cada mensaje desde que entra a `handle`, incluidos los que esperan un slot. El compose fija `stop_grace_period: 90s` en lugar de un flag de uvicorn (el piso de `requirements` es 0.28 y no quiero depender de la versión instalada).
+- **Punto 18 – readiness y DDL:** `missing_configuration()` no hace llamadas de red y nunca devuelve valores. `/health` sigue siendo el HEALTHCHECK (liveness); `/health/ready` es para operadores.
+
 ### Riesgos a tener presentes
 
 - **El hash no es un secreto fuerte:** SHA-256 sin sal de un número de teléfono se revierte por fuerza bruta (hay pocos números posibles). Sirve para no exponer el teléfono a simple vista y para filtrar, pero no protege ante quien tenga acceso a la hoja y quiera descubrir un número. Una mejora posible es `HMAC-SHA256` con una clave del servidor.
@@ -58,7 +69,11 @@ Este documento detalla los requerimientos de arquitectura, calidad de datos y en
 - **La confianza es del mensaje, no del ítem:** `confidence_score` es global, así que un mensaje confuso invalida todos sus gastos aunque los montos se hayan leído bien.
 - **Un saludo sigue costando una llamada al LLM:** el mensaje fuera de dominio se detecta en el Data Quality Gate, es decir, después de consultar a Groq. Filtrar saludos con una regla determinista ahorraría tokens, pero se dejó fuera para no rechazar gastos reales por error.
 - **"mis gastos" es ambiguo:** sin monto ni verbo de compra se interpreta como un pedido de reporte, así que "anotá mis gastos de hoy" genera un reporte en lugar de registrar. Es el costo de relajar la detección; el enfriamiento (`REPORT_COOLDOWN_SECONDS`) acota el daño.
-- **Los videos no tienen respuesta:** el parser ignora todo lo que no sea texto, audio o imagen, así que quien manda un video no recibe ningún aviso.
+- **Contenido multimedia:** los videos, documentos, stickers, ubicaciones, contactos y encuestas ya reciben un aviso fijo, pero su contenido sigue sin leerse (no hay OCR ni transcodificación). Solo las reacciones y los mensajes de protocolo se ignoran en silencio: no son contenido del usuario.
+- **Un reintento puede repetir un aviso:** si el primer envío llegó pero se perdió la respuesta, el usuario puede ver dos veces la misma confirmación. Se aceptó a cambio de no dejarlo sin respuesta (eso sí produce una fila duplicada real cuando reenvía).
+- **El reintento de Sheets no cubre un `5xx` en la escritura:** queda la duda de si el lote se aplicó; el usuario recibe "no se guardó nada" y puede reenviar, porque la idempotencia por `message_id` descarta la repetición.
+- **El esquema de PostgreSQL se crea, no se migra:** `ensure_schema()` no altera una tabla existente. Si falta una columna nueva, el fallo es explícito y el arreglo es manual (`ALTER TABLE`).
+- **La fecha local depende de `tzdata`:** sin ese paquete, `ZoneInfo` no resuelve nombres de zona en una imagen `slim` y todo cae al fallback UTC-3 sin avisar (correcto para Argentina, incorrecto para cualquier otra zona configurada).
 
 ---
 
@@ -171,3 +186,15 @@ Estructura obligatoria para gestionar los accesos:
 
 * **`data_quality.py`:** si no hay gastos, falta el monto o la confianza es menor a 0.30, el resultado se marca con `no_expense_detected` y el bot responde *"No detecté ningún monto o gasto en tu mensaje. Recordá que solo puedo registrar transacciones financieras o generar tu resumen de gastos."*
 * **Contrato:** `transactions` puede venir vacía y `amount` puede ser `null` (el prompt de extracción lo indica) para que la respuesta llegue al gate en lugar de fallar el parseo.
+
+## 14. Robustez Operativa (fallas silenciosas y errores evitables)
+**Objetivo:** que ninguna falla quede en silencio y que ningún error de configuración se descubra recién cuando escribe un usuario.
+
+* **Fecha local:** `src/core/clock.py` (`local_now`, `local_today`) alimenta la extracción, la corrección y la advertencia de fecha futura. `tzdata` en `requirements.txt` permite resolver `TIMEZONE` dentro de una imagen `slim`.
+* **Entrega:** `EvolutionAPIClient` reintenta una vez el envío y la descarga de media ante fallas transitorias.
+* **Límites de entrada:** `MAX_TEXT_CHARS`, `MAX_AUDIO_BYTES` y `MAX_WEBHOOK_BYTES`, evaluados antes de llamar a Groq o Whisper.
+* **Contenido no soportado:** `InputTypeEnum.UNSUPPORTED` en el parser y un aviso fijo en `expense_service` (nunca silencio).
+* **Concurrencia y apagado:** semáforo global (`MAX_CONCURRENT_MESSAGES`), `MessageRouter.wait_until_idle` y `stop_grace_period` en el compose.
+* **Readiness:** `GET /api/v1/health/ready` responde `503` con los nombres de las variables que faltan (sin valores) y el mismo listado se registra como `ERROR` al arrancar.
+* **PostgreSQL:** `ensure_schema()` crea esquema y tabla de forma idempotente al arrancar y antes del primer guardado.
+* **Google Sheets:** reintento seguro (lecturas ante `429`/`5xx`, escrituras solo ante `429`).

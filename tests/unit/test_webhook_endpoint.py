@@ -149,3 +149,18 @@ def test_meta_graph_api_endpoints_are_gone(api, sample_webhook_text_payload):
     assert handshake.status_code == 404
     assert client.post("/api/v1/webhooks/whatsapp", json={"entry": []}).status_code == 404
     assert client.get(URL, params={"hub.challenge": "1234"}).status_code == 405
+
+
+def test_an_oversized_payload_is_acknowledged_without_dispatching(sample_webhook_text_payload):
+    """A body this big is not a WhatsApp message, and a 4xx would make Evolution retry it forever."""
+    fake = FakeRouter()
+    app.dependency_overrides[get_settings] = lambda: make_settings(MAX_WEBHOOK_BYTES=10)
+    app.dependency_overrides[get_message_router] = lambda: fake
+    try:
+        response = TestClient(app).post(URL, json=sample_webhook_text_payload, headers=HEADERS)
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "IGNORED"}
+    assert fake.handled == []

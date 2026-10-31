@@ -1,7 +1,22 @@
 """PostgreSQL repository implementation for Target Analytics Architecture."""
 
+import threading
 from typing import Optional
-from sqlalchemy import Column, Date, Float, MetaData, String, Table, Text, Time, create_engine, or_, select, update
+from sqlalchemy import (
+    Column,
+    Date,
+    Float,
+    MetaData,
+    String,
+    Table,
+    Text,
+    Time,
+    create_engine,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from src.core.config import settings
 from src.core.exceptions import StorageError
@@ -48,6 +63,27 @@ class PostgresExpenseRepository(ExpenseRepositoryInterface):
         except Exception as e:
             logger.error(f"Error creating PostgreSQL engine: {e}")
             raise StorageError(f"PostgreSQL connection initialization failed: {e}") from e
+        self._schema_lock = threading.Lock()
+        self._schema_ready = False
+
+    def ensure_schema(self) -> None:
+        """Create the schema and the table when they are missing (idempotent, no migrations).
+
+        Runs once per process, so a fresh `STORAGE_BACKEND=postgres` deployment needs no manual DDL.
+        Existing tables are never altered: an old schema without a new column keeps failing loudly.
+        """
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            try:
+                with self.engine.begin() as conn:
+                    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {expenses_table.schema}"))
+                metadata.create_all(self.engine)
+            except Exception as e:
+                logger.error(f"Could not ensure the PostgreSQL schema: {e}")
+                raise StorageError(f"PostgreSQL schema initialization failed: {e}") from e
+            self._schema_ready = True
+            logger.info(f"PostgreSQL schema '{expenses_table.schema}' is ready.")
 
     def is_message_processed(self, message_id: str) -> bool:
         """Check if message_id exists in raw_whatsapp.expenses (or any of its batch rows `<id>-<n>`)."""
@@ -90,6 +126,7 @@ class PostgresExpenseRepository(ExpenseRepositoryInterface):
         """Insert every record in one transaction: either all rows land or none do."""
         if not records:
             return []
+        self.ensure_schema()  # no-op once the schema exists (first call of a fresh deployment)
         try:
             with self.engine.begin() as conn:
                 conn.execute(expenses_table.insert(), [self._values(record) for record in records])

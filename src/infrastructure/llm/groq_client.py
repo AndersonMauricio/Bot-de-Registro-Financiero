@@ -3,6 +3,7 @@ import re
 from datetime import date
 from typing import Callable, Optional, TypeVar
 from groq import Groq
+from src.core.clock import local_today
 from src.core.config import settings
 from src.core.exceptions import ExtractionError
 from src.core.logging import logger
@@ -161,7 +162,7 @@ class GroqLLMClient:
         default_currency: str = "ARS",
     ) -> LLMExtractionResponse:
         """Expense branch (approved users only): send message text to Groq and parse the structured response."""
-        ref_date = reference_date or date.today()
+        ref_date = reference_date or local_today()
         user_prompt = (
             f"Fecha de referencia actual: {ref_date.isoformat()}\n"
             f"Moneda por defecto si no se explicita: {default_currency}\n"
@@ -193,7 +194,7 @@ class GroqLLMClient:
         `original` uses the contract's `transaction` keys and must come back untouched except for the
         fields the message corrects explicitly; the Data Quality Gate validates the result as usual.
         """
-        ref_date = reference_date or date.today()
+        ref_date = reference_date or local_today()
         user_prompt = build_correction_user_prompt(
             original_json=json.dumps(original, ensure_ascii=False, default=str),
             reference_date=ref_date,

@@ -1,7 +1,8 @@
 """Google Sheets repository implementation using gspread."""
 
 import threading
-from typing import Any, Optional
+import time
+from typing import Any, Callable, Optional
 import gspread
 from gspread.utils import DateTimeOption, ValueRenderOption, rowcol_to_a1
 from src.core.config import settings
@@ -30,6 +31,31 @@ REPORT_COLUMNS = (
     "medio_de_pago",
     "descripcion",
 )
+
+# A transient Sheets failure is retried once. 429 means the quota window rejected the call without
+# applying it, so repeating it is safe even for a write. A 5xx on a write is NOT retried: the batch may
+# have landed already, and appending it again would duplicate expenses.
+RETRY_DELAY_SECONDS = 0.5
+
+
+def _status_code(error: Exception) -> Optional[int]:
+    """HTTP status behind an API error, when it exposes one (duck-typed so tests need no gspread error)."""
+    code = getattr(getattr(error, "response", None), "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def _with_retry(operation: Callable[[], Any], *, what: str, retry_server_errors: bool = True) -> Any:
+    """Run `operation`, retrying once when the failure is transient and repeating it is safe."""
+    try:
+        return operation()
+    except Exception as e:
+        code = _status_code(e)
+        transient = code == 429 or (retry_server_errors and code is not None and code >= 500)
+        if not transient:
+            raise
+        logger.warning(f"Google Sheets {what} failed (HTTP {code}); retrying once in {RETRY_DELAY_SECONDS:.1f}s.")
+        time.sleep(RETRY_DELAY_SECONDS)
+        return operation()
 
 
 class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
@@ -107,7 +133,10 @@ class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
         """Remember the message ids already stored in the sheet, so idempotency survives restarts."""
         if self._ids_loaded:
             return
-        ids = ws.col_values(columns["message_id"] + 1)
+        ids = _with_retry(
+            lambda: ws.col_values(columns["message_id"] + 1),
+            what="read of the processed message ids",
+        )
         self._processed_message_ids.update(str(v).strip() for v in ids[1:] if v not in (None, ""))
         self._ids_loaded = True
         logger.info(f"Loaded {len(self._processed_message_ids)} processed message ids from the expenses sheet.")
@@ -154,9 +183,17 @@ class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
                 columns = self._get_columns(ws)
                 rows = [self._row_for(record, columns) for record in records]
                 if len(rows) == 1:
-                    ws.append_row(rows[0], value_input_option="USER_ENTERED")
+                    _with_retry(
+                        lambda: ws.append_row(rows[0], value_input_option="USER_ENTERED"),
+                        what="append of the expense",
+                        retry_server_errors=False,
+                    )
                 else:
-                    ws.append_rows(rows, value_input_option="USER_ENTERED")
+                    _with_retry(
+                        lambda: ws.append_rows(rows, value_input_option="USER_ENTERED"),
+                        what="append of the expenses",
+                        retry_server_errors=False,
+                    )
                 self._processed_message_ids.update(record.message_id for record in records)
             logger.info(f"{len(records)} expense(s) successfully persisted in Google Sheets.")
             return [str(record.transaction_id) for record in records]
@@ -176,9 +213,12 @@ class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
             with self._lock:
                 ws = self._get_worksheet()
                 columns = self._get_columns(ws)
-                values = ws.get_all_values(
-                    value_render_option=ValueRenderOption.unformatted,
-                    date_time_render_option=DateTimeOption.formatted_string,
+                values = _with_retry(
+                    lambda: ws.get_all_values(
+                        value_render_option=ValueRenderOption.unformatted,
+                        date_time_render_option=DateTimeOption.formatted_string,
+                    ),
+                    what="read of the expenses",
                 )
         except StorageError:
             raise
@@ -200,9 +240,12 @@ class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
 
     def _read_rows(self, ws: gspread.Worksheet) -> list[list]:
         """All values, with numbers as typed and dates as formatted strings."""
-        return ws.get_all_values(
-            value_render_option=ValueRenderOption.unformatted,
-            date_time_render_option=DateTimeOption.formatted_string,
+        return _with_retry(
+            lambda: ws.get_all_values(
+                value_render_option=ValueRenderOption.unformatted,
+                date_time_render_option=DateTimeOption.formatted_string,
+            ),
+            what="read of the expenses",
         )
 
     def _locate_row(
@@ -287,7 +330,12 @@ class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
                     if name in columns and name in values
                 ]
                 if updates:
-                    ws.batch_update(updates, raw=False)  # USER_ENTERED, exactly like the original append
+                    # USER_ENTERED, exactly like the original append; a 5xx is not retried (it may have landed)
+                    _with_retry(
+                        lambda: ws.batch_update(updates, raw=False),
+                        what="update of the expense",
+                        retry_server_errors=False,
+                    )
             logger.info(f"Expense {record.message_id} updated in Google Sheets.")
             return True
         except Exception as e:
@@ -325,7 +373,11 @@ class GoogleSheetsExpenseRepository(ExpenseRepositoryInterface):
                     else:
                         logger.warning(f"Expense {message_id} is no longer in the sheet; its reply id was not stored.")
                 if updates:
-                    ws.batch_update(updates, raw=False)
+                    _with_retry(
+                        lambda: ws.batch_update(updates, raw=False),
+                        what="update of the reply ids",
+                        retry_server_errors=False,
+                    )
         except Exception as e:
             # Losing the link only degrades later corrections: never fail the answer that is already sent
             logger.warning(f"Could not store the reply id of {len(message_ids)} expense(s): {e}")

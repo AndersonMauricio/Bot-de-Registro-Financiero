@@ -4,6 +4,7 @@ import hashlib
 import re
 from datetime import date
 from typing import Optional
+from src.core.clock import local_today
 from src.core.config import settings
 from src.domain.enums import InputTypeEnum
 from src.domain.models import (
@@ -55,9 +56,10 @@ class DataQualityGate:
         message_id: str,
         user_phone: str,
         input_type: InputTypeEnum,
+        today: Optional[date] = None,
     ) -> DataQualityResult:
         """Validate a single-expense extraction (correction branch). Returns the first result of the batch."""
-        return cls.validate_transactions(llm_response, message_id, user_phone, input_type)[0]
+        return cls.validate_transactions(llm_response, message_id, user_phone, input_type, today)[0]
 
     @classmethod
     def validate_transactions(
@@ -66,6 +68,7 @@ class DataQualityGate:
         message_id: str,
         user_phone: str,
         input_type: InputTypeEnum,
+        today: Optional[date] = None,
     ) -> list[DataQualityResult]:
         """Validate and sanitize every expense of the message, one result per transaction in order.
 
@@ -104,7 +107,7 @@ class DataQualityGate:
             else [f"{message_id}-{index}" for index in range(len(transactions))]
         )
         return [
-            cls._validate_one(meta, tx, record_id, user_phone, input_type)
+            cls._validate_one(meta, tx, record_id, user_phone, input_type, today)
             for tx, record_id in zip(transactions, ids)
         ]
 
@@ -116,6 +119,7 @@ class DataQualityGate:
         message_id: str,
         user_phone: str,
         input_type: InputTypeEnum,
+        today: Optional[date] = None,
     ) -> DataQualityResult:
         """Business rules for one transaction, plus the sanitized record ready to persist."""
         errors: list[str] = []
@@ -145,7 +149,7 @@ class DataQualityGate:
             errors.append("Falta el detalle (concepto) del gasto.")
 
         # 5. Future Date Check (Warning, not blocking)
-        today = date.today()
+        today = today or local_today()
         if tx.transaction_date > today:
             warnings.append(
                 f"La fecha del gasto ({tx.transaction_date.isoformat()}) es futura; hoy es {today.isoformat()}."

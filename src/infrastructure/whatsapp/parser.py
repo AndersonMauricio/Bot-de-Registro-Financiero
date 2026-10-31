@@ -28,6 +28,21 @@ class WhatsAppPayloadParser:
     PHONE_JID_SERVERS = ("s.whatsapp.net", "c.us")
     # Disappearing-message and view-once chats nest the real content under one of these keys
     WRAPPER_KEYS = ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2")
+    # Content the user really sent but the bot cannot read yet: answered with a fixed message, never with silence
+    UNSUPPORTED_CONTENT_KEYS = (
+        "videoMessage",
+        "ptvMessage",
+        "documentMessage",
+        "documentWithCaptionMessage",
+        "stickerMessage",
+        "locationMessage",
+        "liveLocationMessage",
+        "contactMessage",
+        "contactsArrayMessage",
+        "pollCreationMessage",
+        "pollCreationMessageV2",
+        "pollCreationMessageV3",
+    )
 
     @staticmethod
     def is_messages_upsert(payload: dict) -> bool:
@@ -102,6 +117,18 @@ class WhatsAppPayloadParser:
                     quoted_message_id=quoted_id,
                 )
 
+            # 4. User content the bot cannot read yet (video, document, sticker, location, contact, poll):
+            #    the user must get an answer explaining what the bot can do, never silence
+            if any(key in message for key in cls.UNSUPPORTED_CONTENT_KEYS):
+                logger.info(f"Unsupported user content received ({data.get('messageType')}); answering with the scope message.")
+                return ParsedWhatsAppMessage(
+                    message_id=msg_id,
+                    sender_phone=sender,
+                    timestamp=timestamp,
+                    input_type=InputTypeEnum.UNSUPPORTED,
+                )
+
+            # 5. Reactions, protocol messages and edits are not user content: answering would be noise
             logger.info(f"Ignored unsupported WhatsApp message type: {data.get('messageType')}")
             return None
 

@@ -13,7 +13,7 @@ from src.domain.models import OnboardingData, OnboardingLLMResponse
 from src.infrastructure.storage.sheets_users_repo import HEADERS, GoogleSheetsUserRepository
 from src.infrastructure.whatsapp.client import EvolutionAPIClient
 from src.main import app
-from src.services.expense_service import ExpenseProcessingService
+from src.services.expense_service import UNSUPPORTED_CONTENT_MESSAGE, ExpenseProcessingService
 from src.services.report_service import ReportService
 from src.infrastructure.cache.ttl_cache import TTLCache
 from src.api.v1.dependencies import get_user_repository
@@ -86,15 +86,15 @@ def system(sample_valid_llm_response):
     client = TestClient(app)
     counter = iter(range(1, 1000))
 
-    def send(text: str):
+    def send(text: str, message: dict = None, message_type: str = "conversation"):
         from_phone = f"{PHONE}@s.whatsapp.net"
         payload = {
             "event": "messages.upsert",
             "instance": "test-instance",
             "data": {
                 "key": {"remoteJid": from_phone, "fromMe": False, "id": f"MSG{next(counter):04d}"},
-                "message": {"conversation": text},
-                "messageType": "conversation",
+                "message": message or {"conversation": text},
+                "messageType": message_type,
             },
         }
         response = client.post(URL, json=payload, headers={"x-webhook-secret": SECRET})
@@ -229,3 +229,14 @@ def test_an_approved_user_gets_their_report_and_only_their_own_data(system):
     assert len(rows) == 1 and rows[0]["monto"] == 15.5
     assert groq.expense_calls == ["Almorcé sushi por 15.50 USD pagando con débito"]  # the request never reached the LLM
     assert len(expenses.saved) == 2  # nothing was registered for the request itself
+
+
+def test_a_video_gets_an_answer_instead_of_silence(system):
+    """Only the edges are simulated: a real webhook payload must end in a WhatsApp reply, not in nothing."""
+    send, gateway, worksheet, clock, groq, expenses = system
+    worksheet.rows.append([PHONE, "Lucía Fernández", "lucia@example.com", 1, ""])  # approved
+
+    send("", message={"videoMessage": {"mimetype": "video/mp4", "caption": ""}}, message_type="videoMessage")
+
+    assert gateway.sent_texts() == [UNSUPPORTED_CONTENT_MESSAGE]
+    assert expenses.saved == [] and groq.expense_calls == []

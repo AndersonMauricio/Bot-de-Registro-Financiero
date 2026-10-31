@@ -76,11 +76,12 @@ flowchart TD
 - **Webhook:** Evolution envía `messages.upsert` a FastAPI con el header `x-webhook-secret`; el servicio responde `200` de inmediato y procesa en segundo plano. Se ignoran los mensajes propios (`fromMe`), los grupos, los demás eventos y las otras instancias.
 - **Acceso estricto:** si no se puede verificar el estado de un número, no se registra nada.
 - **"Escribiendo…":** mientras Groq transcribe o procesa, el bot envía la presencia `composing` por Evolution y la corta justo antes de responder.
-- **Concurrencia:** se procesa un mensaje a la vez por número y se descartan las reentregas del webhook (mismo `message_id`).
+- **Concurrencia:** se procesa un mensaje a la vez por número y se descartan las reentregas del webhook (mismo `message_id`). Como mucho `MAX_CONCURRENT_MESSAGES` mensajes (4 por defecto) se procesan en paralelo: una ráfaga queda en cola en lugar de saturar Groq. Al apagar, el servicio espera hasta `SHUTDOWN_DRAIN_SECONDS` por los mensajes en vuelo (Evolution ya recibió su `200` y no los reenviaría); el `stop_grace_period: 90s` del compose evita que Docker los corte.
 - **Audio:** se toma del base64 inline del webhook; si falta o viene corrupto, se descarga desde Evolution (`getBase64FromMediaMessage`) y se transcribe con Whisper.
 - **Aprobaciones en tiempo real:** un Apps Script en la hoja avisa a `/api/v1/webhooks/sheets` cuando se edita `Estado`: el bot olvida solo ese número y le escribe al cliente por WhatsApp para avisarle que ya puede registrar gastos (`1`) o que no fue aprobado (`2`) ([guía y diagnóstico](docs/apps_script_usuarios.md)). Si no se puede releer la hoja, no se avisa nada y el acceso falla cerrado.
 - **Reportes por demanda:** un pedido como "quiero mi resumen", "mis gastos" o "¿cuánto gasté este mes?" (texto o audio) no se registra como gasto: se genera un Spreadsheet con **solo los gastos de ese usuario** (filtro estricto por `user_phone_hash`) y se comparte en solo lectura con el email del onboarding. Se detecta por palabras clave (`resumen`, `reporte`, `informe`, `extracto`, `mis gastos`, `cuánto gasté`…), nunca si el mensaje trae un monto o un verbo de compra sin pedido ([report_intent.py](src/services/report_intent.py)).
-- **Imágenes y videos:** todavía no se lee su contenido (sin OCR). Una foto con descripción se registra con el texto de la descripción; sin descripción el bot pide que escriban el detalle y el monto, o que manden un audio. Los videos se ignoran.
+- **Imágenes y videos:** todavía no se lee su contenido (sin OCR). Una foto con descripción se registra con el texto de la descripción; sin descripción el bot pide que escriban el detalle y el monto, o que manden un audio. Los videos, documentos, stickers, ubicaciones, contactos y encuestas reciben un aviso fijo que explica qué sí puede procesar (nunca quedan sin respuesta); las reacciones y los mensajes de protocolo se ignoran en silencio.
+- **Límites de tamaño:** un texto o una transcripción de más de `MAX_TEXT_CHARS` caracteres y un audio de más de `MAX_AUDIO_BYTES` se responden con una instrucción ("dividilo en varios mensajes") **sin** gastar una llamada a Groq o Whisper. Un webhook de más de `MAX_WEBHOOK_BYTES` se descarta con `200` para que Evolution no lo reintente.
 - **Orden de decisión:** una vez obtenido el texto (o la transcripción), el bot evalúa en este orden: pedido de reporte → lista numerada pendiente → mensaje citado (corrección) → corrección sin cita → extracción de un gasto nuevo. Detalle en las secciones *Gastos Múltiples en un Solo Mensaje* y *Edición y Corrección de Registros*.
 
 ---
@@ -111,7 +112,7 @@ bot-wpp/
 ├── src/
 │   ├── main.py                    # Aplicación FastAPI
 │   ├── api/v1/                    # webhooks.py (Evolution y Sheets), health.py, dependencies.py
-│   ├── core/                      # Configuración, logging, excepciones y helpers de teléfono/async
+│   ├── core/                      # Configuración, logging, excepciones, reloj local, readiness y helpers de teléfono/async
 │   ├── domain/                    # Enums y modelos Pydantic
 │   ├── services/
 │   │   ├── message_router.py      # Ruteo por estado del número (1 / 2 / vacío)
@@ -275,8 +276,13 @@ Ninguna falla queda en silencio: si algo externo se cae, el usuario recibe un me
 | La base no responde a tiempo | ⚠️ La base de datos **no respondió a tiempo**: puede que no se haya guardado. Verificá con "quiero mi resumen". |
 | Whisper no puede transcribir | ⚠️ No pudimos procesar el audio. **No se registró nada**: reenvialo o escribilo. |
 | Excepción no prevista | ⚠️ Ocurrió un error inesperado… (log con contexto, sin datos sensibles) |
+| Mensaje o audio demasiado grande | ⚠️ "Es demasiado largo… dividilo en varios mensajes": no se registra nada y no se gasta una llamada al proveedor |
 
 Todas las llamadas bloqueantes (Groq, Whisper, repositorio) corren en un hilo con un **tiempo máximo** ([`run_blocking`](src/core/async_utils.py)), y los SDK se configuran con timeouts explícitos: por defecto el cliente de Groq espera 600 s, que dejaría al usuario sin respuesta.
+
+**Entrega de la confirmación:** si Evolution responde con un error transitorio (timeout, conexión, `429` o `5xx`), el envío se reintenta **una vez**. Un gasto guardado sin confirmación haría que el usuario lo reenvíe y se duplique la fila, así que la entrega pesa más que ahorrar un request. Un `4xx` no se reintenta (nunca va a funcionar).
+
+**Fecha del gasto:** "hoy", "ayer" y la advertencia de fecha futura usan la fecha local de `TIMEZONE` ([`clock.py`](src/core/clock.py)), no la del servidor: dentro de Docker el reloj es UTC y después de las 21:00 en Argentina el día ya cambió. La dependencia `tzdata` del `requirements.txt` es lo que permite resolver nombres de zona (`America/Argentina/Buenos_Aires`) en una imagen `slim`.
 
 ---
 
@@ -350,13 +356,13 @@ Tabla `raw_whatsapp.expenses`, definida en [postgres_repo.py](src/infrastructure
 | `raw_text` | `TEXT` | Texto original / transcripción para auditoría |
 | `reply_message_id` | `VARCHAR(128)` (nulo) | ID de la confirmación del bot, para corregir el gasto citándola |
 
-> El esquema `raw_whatsapp` y la tabla `expenses` todavía no se crean automáticamente (no hay migraciones): creálos antes de usar `STORAGE_BACKEND=postgres`. Si la tabla ya existía sin la función de edición, agregá la columna con `ALTER TABLE raw_whatsapp.expenses ADD COLUMN reply_message_id VARCHAR(128);`.
+> El esquema `raw_whatsapp` y la tabla `expenses` **se crean solos** la primera vez que el bot arranca con `STORAGE_BACKEND=postgres` (y también antes del primer guardado, si la base estaba caída al arrancar). El DDL es idempotente (`CREATE SCHEMA IF NOT EXISTS` + `create_all`) y nunca altera una tabla existente: si la tabla ya existía sin la función de edición, agregá la columna con `ALTER TABLE raw_whatsapp.expenses ADD COLUMN reply_message_id VARCHAR(128);`.
 
 ---
 
 ## 🛡️ Reglas de Calidad de Datos
 
-Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7, 9 y 10 viven en [`DataQualityGate`](src/services/data_quality.py); la taxonomía (punto 8) la validan los enums de [enums.py](src/domain/enums.py):
+Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7, 9 y 10 viven en [`DataQualityGate`](src/services/data_quality.py); la taxonomía (punto 8) la validan los enums de [enums.py](src/domain/enums.py) y los límites de entrada (punto 11), el pipeline de [expense_service.py](src/services/expense_service.py):
 1. **Acceso previo:** solo se procesan los mensajes de usuarios aprobados (estado `1`).
 2. **Idempotencia:** se descartan las reentregas del webhook (mismo `message_id`) y se valida que el mensaje no haya sido registrado ya: en Sheets contra la columna `message_id` (se lee una vez al arrancar, así que sobrevive a reinicios) y en PostgreSQL con una restricción única.
 3. **Confianza mínima:** si `confidence_score < 0.65`, el gasto no se guarda y se le pide al usuario que reenvíe el mensaje aclarando monto y concepto. La confianza es del mensaje, no del gasto: un mensaje confuso invalida todos sus gastos.
@@ -367,6 +373,7 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7, 9 
 8. **Taxonomía en español:** la categoría y el medio de pago deben pertenecer a las listas de arriba; `payment_method` es obligatorio.
 9. **Uno o varios gastos:** la validación es por gasto, así que un ítem inválido de un lote no bloquea a los demás; el bot informa exactamente qué se guardó y qué no. Un mensaje con más de `MAX_TRANSACTIONS_PER_MESSAGE` gastos se rechaza pidiendo dividirlo.
 10. **Mensajes que no son un gasto:** un saludo o una pregunta general ("Hola bot", "¿qué es un mvp?") no debe terminar en un error técnico. Si el LLM no devuelve gastos, el gasto no trae monto (o es ≤ 0) o la confianza es menor a `0.30`, el bot responde *"No detecté ningún monto o gasto en tu mensaje. Recordá que solo puedo registrar transacciones financieras o generar tu resumen de gastos."* Entre `0.30` y `0.65` se trata como un gasto real pero poco claro y se pide aclarar monto y concepto (punto 3). En un lote, el mensaje solo aplica si **ningún** ítem parece un gasto; si alguno se registró, se detalla qué falló.
+11. **Límites de entrada:** un texto o transcripción de más de `MAX_TEXT_CHARS` caracteres, un audio de más de `MAX_AUDIO_BYTES` o un webhook de más de `MAX_WEBHOOK_BYTES` se responden con una instrucción (o se ignoran con `200`) **antes** de llamar a Groq o Whisper. Nada de eso se registra.
 
 ---
 
@@ -414,6 +421,11 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7, 9 
    | `HTTP_TIMEOUT_SECONDS` | | Máximo de las llamadas a Evolution API; los audios usan el doble (por defecto `15`). |
    | `MAX_TRANSACTIONS_PER_MESSAGE` | | Gastos que puede describir un solo mensaje; si lo supera, el bot pide dividirlo (por defecto `10`). |
    | `PENDING_SELECTION_TTL_SECONDS` | | Segundos de validez de la lista numerada cuando el bot pregunta qué gasto de un lote corregir (por defecto `600`). |
+   | `MAX_TEXT_CHARS` | | Si el texto o la transcripción supera este largo, el bot pide dividir el mensaje en vez de llamar al LLM (por defecto `8000`). |
+   | `MAX_AUDIO_BYTES` | | Audios más grandes se responden sin llamar a Whisper (por defecto `20000000`, 20 MB). |
+   | `MAX_WEBHOOK_BYTES` | | Payloads más grandes se ignoran con `200` para que Evolution no los reintente (por defecto `35000000`; es mayor que el audio porque viaja en base64). |
+   | `MAX_CONCURRENT_MESSAGES` | | Mensajes procesados en paralelo; el resto queda en cola (por defecto `4`). |
+   | `SHUTDOWN_DRAIN_SECONDS` | | Al apagar, cuánto espera por los mensajes en vuelo (por defecto `25`). |
    | `GOOGLE_APPLICATION_CREDENTIALS` / `GCP_SERVICE_ACCOUNT_B64` | | Credenciales de la cuenta de servicio, si el `.json` no está en `config/credentials/` (donde se detecta solo). |
    | `STORAGE_BACKEND` | | `sheets` (por defecto) o `postgres`. |
    | `POSTGRES_*` | | Conexión a PostgreSQL, solo con `STORAGE_BACKEND=postgres`. |
@@ -435,7 +447,7 @@ Antes de persistir un gasto se aplican estas reglas. Las de los puntos 3 a 7, 9 
    # o con Docker (app en el puerto 8000 + PostgreSQL)
    docker compose up --build
    ```
-   Verificá que responda en `http://localhost:8000/api/v1/health` (la documentación interactiva está en `/docs`).
+   Verificá que responda en `http://localhost:8000/api/v1/health` (la documentación interactiva está en `/docs`). Para saber si la configuración está completa, `http://localhost:8000/api/v1/health/ready` devuelve `200` o un `503` con la lista de variables que faltan (nunca sus valores).
 5. **Conectar Evolution API:** apuntá el webhook de la instancia al bot (solo el evento `MESSAGES_UPSERT`, con el audio inline en base64):
    ```bash
    python scripts/setup_evolution_webhook.py --url https://<tu-dominio>/api/v1/webhooks/evolution

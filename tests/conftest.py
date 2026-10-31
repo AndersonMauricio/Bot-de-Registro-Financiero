@@ -9,6 +9,8 @@ from src.domain.models import ExtractedTransaction, ExtractionMetadata, LLMExtra
 # The tests advance a fake clock by fixed seconds, so they depend on the documented default TTL,
 # not on whatever a developer has in their local `.env`.
 USER_CACHE_TTL_SECONDS_UNDER_TEST = 60
+# Same idea for the robustness knobs: an operator may tune them in `.env` without breaking the suite
+MAX_CONCURRENT_MESSAGES_UNDER_TEST = 4
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +20,7 @@ def _settings_do_not_leak_from_the_environment(monkeypatch):
     Without this, a local `.env` (or an exported variable) silently changes the behaviour under test.
     """
     monkeypatch.setattr(settings, "USER_CACHE_TTL_SECONDS", USER_CACHE_TTL_SECONDS_UNDER_TEST)
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_MESSAGES", MAX_CONCURRENT_MESSAGES_UNDER_TEST)
 
 
 @pytest.fixture
