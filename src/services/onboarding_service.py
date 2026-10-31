@@ -12,7 +12,13 @@ from src.infrastructure.whatsapp.client import EvolutionAPIClient
 from src.infrastructure.whatsapp.parser import ParsedWhatsAppMessage
 from src.services.data_quality import DataQualityGate
 
-# Fixed copy: the LLM drafts questions, but it never gets to announce approval status
+# Fixed copy: the LLM only extracts data, every reply (questions and approval status) is written here
+ONBOARDING_NEW_MESSAGE = (
+    "¡Hola! Para darte de alta y registrar tus gastos, necesito tu nombre, apellido y un email "
+    "(preferentemente de Gmail)."
+)
+ONBOARDING_MISSING_EMAIL_MESSAGE = "Tengo tu nombre, pero me falta tu email. ¿Me lo pasás?"
+ONBOARDING_MISSING_NAME_MESSAGE = "Tengo tu email, pero me falta tu nombre y apellido."
 PENDING_APPROVAL_MESSAGE = (
     "✅ ¡Gracias! Recibimos tus datos.\n\n"
     "Tu cuenta requiere aprobación manual del administrador antes de poder registrar gastos. "
@@ -24,6 +30,25 @@ PENDING_REMINDER_MESSAGE = (
 )
 ONBOARDING_ERROR_MESSAGE = "⚠️ Tuvimos un problema procesando tu mensaje. Por favor intentá de nuevo en unos minutos."
 FIELD_LABELS = {"full_name": "tu nombre y apellido", "email": "tu email"}
+
+
+def onboarding_reply(data: OnboardingData) -> str:
+    """Finite-state machine of the onboarding: the reply depends only on which fields are still missing.
+
+    The state lives in the users sheet (what is already collected), so this is a pure function of it:
+
+        nothing collected    -> ask for everything
+        only the name        -> ask for the email
+        only the email       -> ask for the name
+        everything collected -> pending manual approval (final state)
+    """
+    if data.full_name and data.email:
+        return PENDING_APPROVAL_MESSAGE
+    if data.full_name:
+        return ONBOARDING_MISSING_EMAIL_MESSAGE
+    if data.email:
+        return ONBOARDING_MISSING_NAME_MESSAGE
+    return ONBOARDING_NEW_MESSAGE
 
 
 class OnboardingService:
@@ -73,7 +98,7 @@ class OnboardingService:
         await self.whatsapp_client.send_text_message(phone, reply)
 
     async def _collect(self, phone: str, text: str, current: OnboardingData) -> str:
-        """Run the onboarding LLM branch, persist any new data and return the reply for the user."""
+        """Extract the data with the LLM, persist what is new and return the reply the FSM picks for the result."""
         try:
             result = await asyncio.to_thread(
                 self.groq_client.collect_onboarding_data, text=text, collected=current
@@ -98,11 +123,8 @@ class OnboardingService:
 
         if merged.is_complete:
             logger.info(f"Onboarding completed for {mask_phone(phone)}; awaiting manual approval.")
-            return PENDING_APPROVAL_MESSAGE
 
-        return result.reply or (
-            f"👋 ¡Hola! Para darte de alta necesito {FIELD_LABELS[merged.missing_fields()[0]]}. Escribímelo por acá."
-        )
+        return onboarding_reply(merged)
 
     @staticmethod
     def _sanitized(data: OnboardingData) -> OnboardingData:

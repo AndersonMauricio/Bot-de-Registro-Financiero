@@ -26,9 +26,9 @@
     },
     "transactions": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "maxItems": 10,
-      "description": "Un elemento por cada gasto mencionado en el mensaje, en el orden en que aparecen",
+      "description": "Un elemento por cada gasto mencionado en el mensaje, en el orden en que aparecen. Vacío si el mensaje no describe ningún gasto (un saludo, una pregunta general)",
       "items": { "$ref": "#/definitions/transaction" }
     },
     "transaction": {
@@ -94,9 +94,9 @@
           "description": "Resumen claro del gasto"
         },
         "amount": {
-          "type": "number",
+          "type": ["number", "null"],
           "exclusiveMinimum": 0,
-          "description": "Monto total del gasto en valor numérico positivo con 2 decimales"
+          "description": "Monto total del gasto en valor numérico positivo con 2 decimales, o null si el usuario no lo mencionó"
         }
       },
       "required": [

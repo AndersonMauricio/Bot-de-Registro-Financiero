@@ -213,8 +213,9 @@ class GroqLLMClient:
         return self._complete_json(messages, parse)
 
     def collect_onboarding_data(self, text: str, collected: OnboardingData) -> OnboardingLLMResponse:
-        """Onboarding branch (unknown users only): extract registration data and draft the next question.
+        """Onboarding branch (unknown users only): extract the registration data the message carries.
 
+        Extraction only: the next question is fixed copy chosen by the onboarding service.
         Uses its own system prompt and examples; it never touches the expense extraction prompt.
         """
         user_prompt = build_onboarding_user_prompt(

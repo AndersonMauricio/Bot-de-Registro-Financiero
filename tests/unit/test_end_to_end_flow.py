@@ -19,6 +19,8 @@ from src.infrastructure.cache.ttl_cache import TTLCache
 from src.api.v1.dependencies import get_user_repository
 from src.services.message_router import ACCESS_DENIED_MESSAGE, MessageRouter
 from src.services.onboarding_service import (
+    ONBOARDING_MISSING_EMAIL_MESSAGE,
+    ONBOARDING_NEW_MESSAGE,
     PENDING_APPROVAL_MESSAGE,
     PENDING_REMINDER_MESSAGE,
     OnboardingService,
@@ -113,9 +115,9 @@ def test_full_lifecycle_unknown_user_onboarding_manual_approval_expense_and_reje
     send, gateway, worksheet, clock, groq, expenses = system
 
     # --- State null: a stranger writes. The bot starts the onboarding and registers nothing.
-    groq.onboarding_result = OnboardingLLMResponse(reply="¡Hola! ¿Cuál es tu nombre y apellido?")
+    groq.onboarding_result = OnboardingLLMResponse()  # the message carries no registration data
     send("hola, gasté 500 en uber")
-    assert gateway.sent_texts() == ["¡Hola! ¿Cuál es tu nombre y apellido?"]
+    assert gateway.sent_texts() == [ONBOARDING_NEW_MESSAGE]
     assert expenses.saved == [] and groq.expense_calls == []
     # the number is registered at first contact (Fecha_Registro set), with no data and no estado
     assert len(worksheet.rows) == 2
@@ -128,11 +130,10 @@ def test_full_lifecycle_unknown_user_onboarding_manual_approval_expense_and_reje
     assert gateway.presence_calls()[0] == {"number": PHONE, "presence": "composing", "delay": 20_000}
 
     # --- Still state null: data arrives piece by piece and is stored in the sheet.
-    groq.onboarding_result = OnboardingLLMResponse(
-        collected=OnboardingData(full_name="Lucía Fernández"), reply="Gracias Lucía. ¿Cuál es tu email?"
-    )
+    groq.onboarding_result = OnboardingLLMResponse(collected=OnboardingData(full_name="Lucía Fernández"))
     send("me llamo Lucía Fernández")
     assert worksheet.rows[1][:4] == [PHONE, "Lucía Fernández", "", ""]
+    assert gateway.sent_texts()[-1] == ONBOARDING_MISSING_EMAIL_MESSAGE
 
     groq.onboarding_result = OnboardingLLMResponse(collected=OnboardingData(email="lucia@example.com"))
     send("lucia@example.com")
@@ -168,7 +169,7 @@ def test_full_lifecycle_unknown_user_onboarding_manual_approval_expense_and_reje
 
 def test_a_stranger_messaging_repeatedly_causes_a_single_sheet_read(system):
     send, gateway, worksheet, _, groq, _ = system
-    groq.onboarding_result = OnboardingLLMResponse(reply="¿Cuál es tu nombre?")
+    groq.onboarding_result = OnboardingLLMResponse()
 
     for _ in range(10):
         send("hola")

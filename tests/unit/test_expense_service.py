@@ -2,12 +2,14 @@
 
 import asyncio
 import base64
+from datetime import date
 import pytest
 from src.core.exceptions import ExtractionError, TranscriptionError
-from src.domain.enums import InputTypeEnum
-from src.domain.models import ExtractionMetadata, LLMExtractionResponse
+from src.domain.enums import InputTypeEnum, PaymentMethodEnum
+from src.domain.models import ExtractedTransaction, ExtractionMetadata, LLMExtractionResponse
 from src.infrastructure.whatsapp.parser import ParsedWhatsAppMessage
-from src.services.expense_service import ExpenseProcessingService
+from src.services.data_quality import NO_EXPENSE_DETECTED_MESSAGE
+from src.services.expense_service import IMAGE_NOT_READABLE_MESSAGE, ExpenseProcessingService
 from tests.fakes import FakeExpenseRepository, FakeGroq, FakeWhatsApp, FakeWhisper
 
 pytestmark = pytest.mark.asyncio
@@ -149,7 +151,12 @@ async def test_image_without_caption_asks_for_text(parts):
 
     await service.process_incoming_message(msg)
 
-    assert "Recibimos tu ticket" in whatsapp.texts[0]
+    assert whatsapp.texts == [
+        "📸 Recibimos tu imagen. Por ahora no puedo leer fotos o videos automáticamente. "
+        "Por favor, escribime el detalle y el monto, o mandame un audio."
+    ]
+    assert whatsapp.texts[0] == IMAGE_NOT_READABLE_MESSAGE
+    assert "MVP" not in whatsapp.texts[0]  # no internal jargon in front of the user
     assert groq.expense_calls == []
 
 
@@ -175,6 +182,83 @@ async def test_low_confidence_extraction_is_not_saved_and_explains_why(parts):
     assert result.is_valid is False
     assert repo.saved == []
     assert "No pude registrar tu gasto" in whatsapp.texts[0]
+
+
+# ------------------------------------------------------- out of domain: not an expense, not a server error
+def no_expense_response(confidence: float = 0.0, **extra) -> LLMExtractionResponse:
+    return LLMExtractionResponse(
+        metadata=ExtractionMetadata(confidence_score=confidence, raw_text="¿Qué es un mvp?"), **extra
+    )
+
+
+def amountless_transaction() -> ExtractedTransaction:
+    return ExtractedTransaction(
+        transaction_date=date(2026, 10, 19),
+        currency="ARS",
+        payment_method=PaymentMethodEnum.NO_ESPECIFICADO,
+        description="Compras en el súper",
+    )
+
+
+def assert_scope_explanation(whatsapp, repo, result):
+    assert result.is_valid is False
+    assert repo.saved == []
+    assert whatsapp.texts == [NO_EXPENSE_DETECTED_MESSAGE]
+    assert "servidor" not in whatsapp.texts[0] and "⚠️" not in whatsapp.texts[0]
+
+
+async def test_a_message_without_any_expense_gets_the_scope_explanation_instead_of_a_server_error(parts):
+    service, groq, _, repo, whatsapp = parts
+    groq.expense_result = no_expense_response()  # "transactions": [] is how the model says "not an expense"
+
+    result = await service.process_incoming_message(text_message("¿Qué es un mvp?"))
+
+    assert_scope_explanation(whatsapp, repo, result)
+    assert whatsapp.texts[0] == (
+        "No detecté ningún monto o gasto en tu mensaje. Recordá que solo puedo registrar transacciones "
+        "financieras o generar tu resumen de gastos."
+    )
+
+
+async def test_a_very_low_confidence_extraction_gets_the_scope_explanation(parts):
+    service, groq, _, repo, whatsapp = parts
+    groq.expense_result = no_expense_response(0.1, transaction=groq.expense_result.transaction)
+
+    result = await service.process_incoming_message(text_message("Hola bot"))
+
+    assert_scope_explanation(whatsapp, repo, result)
+
+
+async def test_an_expense_without_an_amount_gets_the_scope_explanation(parts):
+    service, groq, _, repo, whatsapp = parts
+    groq.expense_result = no_expense_response(0.9, transaction=amountless_transaction())
+
+    result = await service.process_incoming_message(text_message("Gasté en el súper"))
+
+    assert_scope_explanation(whatsapp, repo, result)
+
+
+async def test_an_unclear_but_real_expense_still_asks_to_clarify_amount_and_concept(parts):
+    """Between 'not an expense' and 'sure enough': the user is asked to clarify, not told the bot cannot help."""
+    service, groq, _, repo, whatsapp = parts
+    groq.expense_result = no_expense_response(0.5, transaction=groq.expense_result.transaction)
+
+    await service.process_incoming_message(text_message("algo por ahí de 15 usd"))
+
+    assert repo.saved == []
+    assert "No pude registrar tu gasto" in whatsapp.texts[0]
+    assert "aclarando el monto y concepto" in whatsapp.texts[0]
+    assert NO_EXPENSE_DETECTED_MESSAGE not in whatsapp.texts[0]
+
+
+async def test_a_real_llm_failure_is_still_reported_as_a_server_error_not_as_out_of_domain(parts):
+    service, groq, _, repo, whatsapp = parts
+    groq.error = ExtractionError("all models failed")
+
+    await service.process_incoming_message(text_message("¿Qué es un mvp?"))
+
+    assert "error en el servidor de inteligencia artificial" in whatsapp.texts[0]
+    assert NO_EXPENSE_DETECTED_MESSAGE not in whatsapp.texts[0]
 
 
 async def test_llm_failure_is_reported(parts):
@@ -271,6 +355,25 @@ async def test_a_real_expense_that_mentions_a_summary_still_goes_through_extract
 
     assert reports.calls == []
     assert len(groq.expense_calls) == 1 and len(repo.saved) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "¿Cuánto gasté este mes?",
+        "mis gastos",
+        "Hola, ¿me podés pasar un resumen de todo lo que gasté?",
+        "resumen de octubre 2026",
+    ],
+)
+async def test_natural_language_report_requests_never_reach_the_expense_pipeline(with_reports, text):
+    service, groq, _, repo, whatsapp, reports = with_reports
+
+    await service.process_incoming_message(text_message(text))
+
+    assert reports.calls == [PHONE]
+    assert whatsapp.texts == ["📊 reporte listo"]
+    assert groq.expense_calls == [] and repo.saved == []
 
 
 async def test_without_a_report_service_report_requests_behave_as_before(parts):

@@ -78,6 +78,14 @@ def test_sheet_never_contains_the_raw_phone_number():
 BASE_TRANSACTION = dict(transaction_date=date(2026, 10, 19), amount=10.0, currency="ARS", description="Uber")
 
 
+def test_a_missing_amount_does_not_fail_the_parse_so_the_gate_can_answer_it():
+    without_amount = {k: v for k, v in BASE_TRANSACTION.items() if k != "amount"}
+
+    assert ExtractedTransaction(**without_amount, payment_method="Efectivo").amount is None
+    assert ExtractedTransaction(**{**BASE_TRANSACTION, "amount": None}, payment_method="Efectivo").amount is None
+    assert ExtractedTransaction(**{**BASE_TRANSACTION, "amount": 10.456}, payment_method="Efectivo").amount == 10.46
+
+
 def test_payment_method_is_mandatory_in_the_extraction_contract():
     with pytest.raises(ValidationError):
         ExtractedTransaction(**BASE_TRANSACTION, category="Transporte")
